@@ -1,0 +1,164 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+# alternix-net — non-interactive network verbs for osm-install
+#
+# Wraps the existing primitives in installer/network.sh so the GUI
+# never has to reimplement them. network.sh itself is NOT modified.
+#
+# CONVENTION:
+#   stdout  machine-readable data only (one record per line)
+#   stderr  human-readable progress / errors
+#   exit    0 = success, non-zero = failure
+#
+# VERBS
+#   drivers                     load NIC + WiFi kernel modules
+#   list                        iface<TAB>wifi|eth<TAB>up|down
+#   scan <iface>                one SSID per line
+#   connect-eth <iface>         bring up + DHCP
+#   connect-wifi <iface> <ssid> associate + DHCP; PSK read from STDIN
+#                               (blank stdin = open network)
+#   status                      exit 0 if the internet is reachable
+#   synctime                    set clock from HTTP Date header
+#
+# The PSK is read from stdin, never argv — argv is world-readable
+# through /proc/<pid>/cmdline for the lifetime of the process.
+# ═══════════════════════════════════════════════════════════════
+
+set -uo pipefail
+
+INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Source the real modules ───────────────────────────────────────
+# ui.sh must come first: network.sh calls info/ok/warn/err/spin_*.
+# shellcheck source=/dev/null
+source "${INSTALLER_DIR}/ui.sh"
+# shellcheck source=/dev/null
+source "${INSTALLER_DIR}/network.sh"
+
+# ── Neutralise the TUI helpers ────────────────────────────────────
+# network.sh's primitives call these. In a GUI context the spinner
+# would fork a background loop writing escape codes forever, and the
+# colour codes would corrupt the machine-readable stdout stream.
+# Redefining them here changes nothing in ui.sh itself.
+spin_start() { :; }
+spin_stop()  { :; }
+info()  { echo "$*"  >&2; }
+ok()    { echo "$*"  >&2; }
+warn()  { echo "$*"  >&2; }
+err()   { echo "$*"  >&2; }
+die()   { echo "$*"  >&2; exit 1; }
+section() { :; }
+banner()  { :; }
+
+usage() {
+    sed -n '2,25p' "${BASH_SOURCE[0]}" >&2
+    exit 2
+}
+
+# ── Verbs ─────────────────────────────────────────────────────────
+v_list() {
+    local iface state
+    while IFS= read -r iface; do
+        [[ -z "$iface" ]] && continue
+        state="down"
+        [[ "$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null)" == "up" ]] && state="up"
+        if net_is_wireless "$iface"; then
+            printf '%s\twifi\t%s\n' "$iface" "$state"
+        else
+            printf '%s\teth\t%s\n' "$iface" "$state"
+        fi
+    done < <(net_list_interfaces)
+}
+
+v_scan() {
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || die "scan: missing interface"
+    net_is_wireless "$iface" || die "scan: ${iface} is not a wireless interface"
+    net_wifi_scan "$iface"
+}
+
+v_connect_eth() {
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || die "connect-eth: missing interface"
+    net_setup_ethernet "$iface"
+}
+
+v_connect_wifi() {
+    local iface="${1:-}" ssid="${2:-}"
+    [[ -n "$iface" ]] || die "connect-wifi: missing interface"
+    [[ -n "$ssid"  ]] || die "connect-wifi: missing SSID"
+
+    command -v wpa_supplicant >/dev/null 2>&1 || \
+        die "wpa_supplicant not found — cannot connect to WiFi."
+
+    # PSK arrives on stdin so it never appears in /proc/<pid>/cmdline.
+    local psk=""
+    IFS= read -r psk || true
+
+    local wpa_conf
+    wpa_conf=$(mktemp /tmp/wpa.XXXXXX.conf)
+    chmod 600 "$wpa_conf"
+
+    if [[ -z "$psk" ]]; then
+        cat > "$wpa_conf" << EOF
+network={
+    ssid="${ssid}"
+    key_mgmt=NONE
+}
+EOF
+    else
+        if ! wpa_passphrase "$ssid" "$psk" > "$wpa_conf" 2>/dev/null; then
+            rm -f "$wpa_conf"
+            die "wpa_passphrase rejected the password (8-63 characters required)."
+        fi
+    fi
+
+    pkill -f "wpa_supplicant.*${iface}" 2>/dev/null
+    sleep 0.5
+
+    ip link set "$iface" up 2>/dev/null
+    wpa_supplicant -B -i "$iface" -c "$wpa_conf" >/dev/null 2>&1
+    sleep 4
+
+    net_dhcp "$iface"
+
+    if ! net_is_connected; then
+        rm -f "$wpa_conf"
+        echo "Failed to connect to '${ssid}'." >&2
+        return 1
+    fi
+
+    # POWERSAVE OFF — mirrors network.sh net_wifi_tui.
+    # WiFi powersave stalls debootstrap mid-download.
+    iw dev "$iface" set power_save off 2>/dev/null || true
+
+    # WIFI CARRYOVER — mirrors network.sh net_wifi_tui.
+    # configure_system.sh copies this file into the installed system
+    # so the target auto-reconnects on first boot. Without it the
+    # user reboots into a machine with no network.
+    mkdir -p /etc/wpa_supplicant
+    {
+        echo "ctrl_interface=/run/wpa_supplicant"
+        echo "update_config=1"
+        cat "$wpa_conf"
+    } > /etc/wpa_supplicant/wpa_supplicant.conf
+    chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+
+    rm -f "$wpa_conf"
+    echo "Connected to '${ssid}'." >&2
+    return 0
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────
+[[ $# -ge 1 ]] || usage
+
+case "$1" in
+    drivers)      net_load_drivers ;;
+    list)         v_list ;;
+    scan)         shift; v_scan "$@" ;;
+    connect-eth)  shift; v_connect_eth "$@" ;;
+    connect-wifi) shift; v_connect_wifi "$@" ;;
+    status)       net_is_connected ;;
+    synctime)     net_sync_clock ;;
+    *)            usage ;;
+esac

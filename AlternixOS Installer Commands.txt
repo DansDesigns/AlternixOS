@@ -14,7 +14,7 @@ cd ~
 sudo rm -rf ~/alternix-installer
 
 # copy installer folder from Windows file system to Debian WSL2 (replace "Users/dan/github" with your username & folder location):
-cp -r /mnt/c/Users/dan/github/AlternixOS/alternix-installer ~/alternix-installer
+cp -r /mnt/c/Users/dan/github/AlternixOS/alternix-installer-gui ~/alternix-installer
 
 
 cd ~/alternix-installer
@@ -34,7 +34,7 @@ sudo bash build-iso.sh --amd    # AMD64
 
 # 3. Copy it back to windows file system when done (replace "dan/github" with your username & folder location):
 
-cp ~/alternix-installer/alternix-installer.iso /mnt/c/Users/dan/github/AlternixOS/
+cp ~/alternix-installer/alternix-installer.iso /mnt/c/Users/dan/github/AlternixOS/alterniix-installer-gui.iso
 
 (future versions)
 cp ~/alternix-installer/alternix-installer-amd64.iso /mnt/c/Users/dan/github/AlternixOS/

@@ -1,0 +1,196 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+# alternix-media — save the install log onto the USB stick
+#
+# The log normally lives in /tmp, which is a RAM disk. It disappears
+# on reboot, and on a tablet with no keyboard there is no practical
+# way to read it before then. This writes a copy onto the USB stick
+# you booted from, so it can be read on another machine afterwards.
+#
+# Whether that works depends on how the stick was written:
+#
+#   Rufus, "ISO Image mode" (the default)
+#       The stick is FAT32 and the log is saved. Nothing else to do.
+#
+#   Rufus, "DD Image mode", or dd/Etcher on Linux
+#       The stick is a raw ISO9660 image and is read-only, so there
+#       is nowhere to write. The log stays in /tmp only.
+#
+# If there happens to be any other writable partition on the same
+# stick, that is used instead. No setup is required for that either.
+#
+# VERBS
+#   savelog   copy the install logs onto the stick
+#   info      show what was found (for troubleshooting)
+# ═══════════════════════════════════════════════════════════════
+
+set -uo pipefail
+
+MEDIA_MNT="/run/alternix-media"
+
+_log() { echo "$*" >&2; }
+
+# ── Where did we boot from? ───────────────────────────────────────
+_medium_mountpoint() {
+    local mp
+    for mp in /run/live/medium /lib/live/mount/medium /cdrom; do
+        if mountpoint -q "$mp" 2>/dev/null; then
+            echo "$mp"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_boot_device() {
+    local mp src pk
+    mp=$(_medium_mountpoint) || return 1
+    src=$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null | head -1)
+    [[ "$src" == /dev/* ]] || return 1
+    pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)
+    if [[ -n "$pk" ]]; then
+        echo "/dev/${pk}"
+    else
+        echo "$src"
+    fi
+}
+
+_is_writable() {
+    local dir="$1"
+    touch "${dir}/.alternix-write-test" 2>/dev/null || return 1
+    rm -f "${dir}/.alternix-write-test"
+    return 0
+}
+
+# ── Find somewhere writable ───────────────────────────────────────
+# The first choice is the stick we booted from, because that needs no
+# setup at all. live-boot mounts it read-only, so try remounting it
+# read-write. That succeeds on FAT32 and fails on ISO9660, which is
+# exactly the distinction that matters here.
+_writable_dir() {
+    local mp
+    if mp=$(_medium_mountpoint); then
+        if _is_writable "$mp"; then
+            echo "$mp"
+            return 0
+        fi
+        if mount -o remount,rw "$mp" 2>/dev/null && _is_writable "$mp"; then
+            echo "$mp"
+            return 0
+        fi
+        # Put it back the way live-boot had it.
+        mount -o remount,ro "$mp" 2>/dev/null || true
+    fi
+
+    # The second choice is any other writable partition on the same stick.
+    local boot boot_name dev fstype
+    boot=$(_boot_device) || return 1
+    boot_name="${boot#/dev/}"
+
+    while read -r dev fstype; do
+        [[ -z "$dev" || -z "$fstype" ]] && continue
+        [[ "$dev" == "${boot_name}"* && "$dev" != "$boot_name" ]] || continue
+        case "$fstype" in
+            vfat|exfat|ntfs|ext2|ext3|ext4) ;;
+            *) continue ;;
+        esac
+        mountpoint -q "$MEDIA_MNT" && umount "$MEDIA_MNT" 2>/dev/null
+        mkdir -p "$MEDIA_MNT"
+        if mount -o rw "/dev/${dev}" "$MEDIA_MNT" 2>/dev/null; then
+            if _is_writable "$MEDIA_MNT"; then
+                echo "$MEDIA_MNT"
+                return 0
+            fi
+            umount "$MEDIA_MNT" 2>/dev/null
+        fi
+    done < <(lsblk -rno NAME,FSTYPE 2>/dev/null)
+
+    return 1
+}
+
+v_savelog() {
+    local dir
+    if ! dir=$(_writable_dir); then
+        _log "The USB stick is read-only, so the log could not be saved to it."
+        _log "This happens when the stick was written with dd, or with Rufus"
+        _log "in DD Image mode. Writing it with Rufus in ISO Image mode gives"
+        _log "a writable stick. For this session the log is still available"
+        _log "at /tmp/alternix-install.log."
+        return 1
+    fi
+
+    local stamp dest
+    stamp=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
+    dest="${dir}/alternix-logs/${stamp}"
+    mkdir -p "$dest" 2>/dev/null || { _log "Could not create ${dest}"; return 1; }
+
+    local f
+    for f in /tmp/alternix-install.log \
+             /tmp/alternix-de-target.log \
+             /tmp/alternix-xorg.log; do
+        [[ -f "$f" ]] && cp -f "$f" "${dest}/" 2>/dev/null
+    done
+
+    # The settings are useful for reproducing a failure, but the config
+    # file holds the user's password in clear text and this stick can be
+    # read on any machine, so that one line is left out.
+    if [[ -f /tmp/alternix-install.conf ]]; then
+        grep -v '^ALTERNIX_PASSWORD=' /tmp/alternix-install.conf \
+            > "${dest}/install.conf" 2>/dev/null
+    fi
+
+    # These come from the config file rather than the environment.
+    # This script runs as a separate process, so install.sh's shell
+    # variables are not visible here — reading them from the
+    # environment gave "unknown" for everything.
+    local t_disk="unknown" t_desktop="unknown" t_errors="unknown"
+    if [[ -f /tmp/alternix-install.conf ]]; then
+        t_disk=$(sed -n "s/^TARGET_DISK=//p"        /tmp/alternix-install.conf | tr -d "'\"" | head -1)
+        t_desktop=$(sed -n "s/^ALTERNIX_DESKTOP=//p" /tmp/alternix-install.conf | tr -d "'\"" | head -1)
+        [[ -z "$t_disk"    ]] && t_disk="unknown"
+        [[ -z "$t_desktop" ]] && t_desktop="unknown"
+    fi
+    # err() writes a ✗ marker, so counting those gives the error total.
+    if [[ -f /tmp/alternix-install.log ]]; then
+        t_errors=$(grep -c "$(printf '\u2717')" /tmp/alternix-install.log 2>/dev/null || echo 0)
+    fi
+
+    {
+        echo "Alternix install log"
+        echo "Saved:   $(date 2>/dev/null)"
+        echo "Machine: $(uname -srm 2>/dev/null)"
+        echo "Target:  ${t_disk}"
+        echo "Desktop: ${t_desktop}"
+        echo "Errors:  ${t_errors}"
+    } > "${dest}/summary.txt" 2>/dev/null
+
+    sync
+    _log "Log saved to the USB stick, in alternix-logs/${stamp}"
+    echo "$dest"
+    return 0
+}
+
+v_info() {
+    local mp boot dir
+    if mp=$(_medium_mountpoint); then
+        echo "Booted from:  ${mp}"
+    else
+        echo "Booted from:  not found"
+    fi
+    if boot=$(_boot_device); then
+        echo "USB device:   ${boot}"
+    else
+        echo "USB device:   not found"
+    fi
+    if dir=$(_writable_dir); then
+        echo "Writable at:  ${dir}"
+    else
+        echo "Writable at:  nowhere, the stick is read-only"
+    fi
+}
+
+case "${1:-}" in
+    savelog) v_savelog ;;
+    info)    v_info ;;
+    *)       sed -n '2,26p' "${BASH_SOURCE[0]}" >&2; exit 2 ;;
+esac
