@@ -263,23 +263,41 @@ KBEOF
     echo ""
 
     # ═══════════════════════════════════════════════════════════
-    # STDIN FOR THE UNATTENDED RUN — DO NOT REMOVE
-    # install-alternix_devuan.sh asks three questions:
-    #   line   34  username           (read -rp, while-true loop)
-    #   line  176  telephony  [1/2]   (read -rp, while-true loop)
-    #   line 1207  restart or continue [1/2] (read -n 1 -s -r)
+    # STDIN FOR THE UNATTENDED RUN — ORDER MATTERS, DO NOT SIMPLIFY
+    # Under the graphical installer stdin is a closed pipe. The
+    # AlternixDE script has `set -e` on line 2, and a bare `read`
+    # returns non-zero at EOF, so an unfed prompt kills it instantly
+    # with exit 1 and no output at all.
     #
-    # Under the graphical installer stdin is a closed pipe. That script
-    # has `set -e` on line 2, and a bare `read` returns non-zero at EOF,
-    # so the very first prompt kills it instantly with exit code 1 —
-    # before printing anything. That is why the log shows the installer
-    # exiting with code 1 and no explanation above it.
+    # It reads stdin at four points, and they want different answers.
+    # Feeding "2" to everything (which is what an earlier version did)
+    # force-skipped telephony and broke auto-cpufreq:
     #
-    # The stream answers the username once and then feeds "2" forever:
-    # "2" is Skip for telephony and Continue for the final prompt, and
-    # because `yes` never ends there is no second EOF to trip `set -e`.
-    # The interactive path is left exactly as it was.
+    #   line   34  username                 -> the real username
+    #   line  176  telephony [1/2]          -> the user's choice
+    #   line 1181  ./auto-cpufreq-installer -> "i" for install
+    #
+    # On that third one, the upstream installer prompts
+    #   "Select a key [I]nstall/[R]emove or press ctrl+c to quit:"
+    # and its dispatch is:
+    #   case $answer in I|i) ...;; R|r) ...;;
+    #     *) echo "Unknown key, aborting ..."; exit 1 ;;
+    # so any other answer makes it exit 1, which `set -e` in the
+    # AlternixDE script turns into the whole desktop build dying.
+    # Feeding "i" here is a workaround. The proper fix is upstream in
+    # install-alternix_devuan.sh: that installer accepts --install as
+    # an argument and then never reads stdin at all.
+    #   line 1211  restart or continue      -> ALWAYS "2"
+    #
+    # That last one must never be answered "1". Option 1 runs
+    # `sudo reboot` immediately, which would restart the machine in the
+    # middle of the install, before the bootloader has been written.
+    #
+    # `yes 2` on the end keeps the stream alive so there is never a
+    # second EOF, and harmlessly re-answers the final prompt if
+    # auto-cpufreq consumed fewer lines than expected.
     # ═══════════════════════════════════════════════════════════
+    local _tele="${ALTERNIX_TELEPHONY:-2}"
     local alt_exit=0
     local _alt_de_log="/tmp/alternix-de-target.log"
     : > "$_alt_de_log"
@@ -344,7 +362,7 @@ KBEOF
             /bin/bash -c \
             "cd /home/${ALTERNIX_USERNAME}/Alternix && \
              bash install-alternix_devuan.sh" \
-            < <({ echo "${ALTERNIX_USERNAME}"; yes 2; }) \
+            < <({ echo "${ALTERNIX_USERNAME}"; echo "${_tele}"; echo "i"; yes 2; }) \
             2>&1 | tee -a "$_alt_de_log"
         # PIPESTATUS, not $? — $? here is tee's exit code, which is
         # always 0 and would report every failed build as a success.

@@ -95,6 +95,7 @@ struct Answers {
     QString username, password, hostname = "alternix";
     QString timezone = "Europe/London", locale = "en_GB.UTF-8";
     QString desktop  = "alternix";
+    bool    telephony = false;
     QString targetDisk, targetDiskSize, targetDiskModel;
     bool    useSwap  = true;
     int     swapMb   = 2048;
@@ -1423,12 +1424,29 @@ public:
             m_cards.append(card);
             body()->addWidget(card);
         }
+
+        body()->addSpacing(10);
+        // Asked here because the AlternixDE script prompts for it
+        // half an hour into its own run, where nobody is watching.
+        m_telephony = new QCheckBox(
+            QStringLiteral("Install mobile telephony (plasma-dialer, spacebar)"));
+        m_telephony->setStyleSheet(
+            QString("QCheckBox { color: %1; font-size: 16px; spacing: 12px; }"
+                    "QCheckBox::indicator { width: 26px; height: 26px; }").arg(FG));
+        body()->addWidget(m_telephony);
+        body()->addWidget(mkLabel(
+            QStringLiteral("Only useful on a phone or tablet with a modem. "
+                           "Adds KDE dialer applications."), 14, FG_DIM));
+
         body()->addStretch(1);
 
         QPushButton *b = mkButton(QStringLiteral("Back"));
         QPushButton *n = mkButton(QStringLiteral("Next"), true);
         QObject::connect(b, &QPushButton::clicked, this, back);
-        QObject::connect(n, &QPushButton::clicked, this, next);
+        QObject::connect(n, &QPushButton::clicked, this, [this, next]() {
+            g_ans.telephony = m_telephony->isChecked();
+            next();
+        });
         footer()->addWidget(b);
         footer()->addStretch(1);
         footer()->addWidget(n);
@@ -1436,6 +1454,7 @@ public:
 
 private:
     QList<ClickableCard *> m_cards;
+    QCheckBox *m_telephony = nullptr;
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -1497,6 +1516,9 @@ public:
         addRow(QStringLiteral("Timezone"),  g_ans.timezone);
         addRow(QStringLiteral("Language"),  g_ans.locale);
         addRow(QStringLiteral("Desktop"),   g_ans.desktop);
+        addRow(QStringLiteral("Telephony"),
+               g_ans.telephony ? QStringLiteral("Install")
+                               : QStringLiteral("Skip"));
         addRow(QStringLiteral("Network"),
                g_ans.netSsid.isEmpty()
                    ? (g_ans.netIface.isEmpty() ? QStringLiteral("Already connected")
@@ -1946,6 +1968,9 @@ static bool writeConf(QString *errOut) {
     ts << "ALTERNIX_TIMEZONE=" << shQuote(g_ans.timezone) << "\n";
     ts << "ALTERNIX_LOCALE="   << shQuote(g_ans.locale)   << "\n";
     ts << "ALTERNIX_DESKTOP="  << shQuote(g_ans.desktop)  << "\n";
+    // 1 = install, 2 = skip. Matches the answers the AlternixDE
+    // script expects at its own telephony prompt.
+    ts << "ALTERNIX_TELEPHONY=" << (g_ans.telephony ? "1" : "2") << "\n";
     ts << "TARGET_DISK="       << shQuote(g_ans.targetDisk) << "\n";
     ts << "PART_MODE='guided'\n";
     ts << "USE_SWAP=" << (g_ans.useSwap ? 1 : 0) << "\n";
