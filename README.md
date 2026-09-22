@@ -2,10 +2,7 @@
 
 A custom, systemd-free Linux operating system built on Devuan
 GNU/Linux, designed as the foundation for the
-[AlternixDE](https://alternitech.square.site/product/alternix/I52QT6S34WRONSEGWCUGEDAV) desktop environment.
-It incorporates the seL4 microkernel from source during installation,
-optimised for your exact CPU (`-march=native`), and installs it to
-`/opt/sel4/`.
+[AlternixDE](https://github.com/DansDesigns/AlternixDE) desktop environment.
 
 ---
 
