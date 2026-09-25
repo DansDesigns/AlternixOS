@@ -1639,6 +1639,20 @@ public:
         // ALTERNIX_UNATTENDED is set, and stripAnsi() removes whatever
         // is left.
         env.insert(QStringLiteral("TERM"), QStringLiteral("xterm"));
+
+        // DEBCONF MUST NEVER ASK — DO NOT REMOVE
+        // Nothing in the installer scripts set DEBIAN_FRONTEND. Without
+        // it debconf tries its dialog frontend, finds no terminal, and
+        // falls back to reading answers from stdin. Under this GUI no
+        // answer can ever arrive, so any package that asks a question
+        // stops the install permanently with no output at all.
+        env.insert(QStringLiteral("DEBIAN_FRONTEND"),
+                   QStringLiteral("noninteractive"));
+        env.insert(QStringLiteral("DEBCONF_NONINTERACTIVE_SEEN"),
+                   QStringLiteral("true"));
+        // apt-listchanges can open a pager and wait for a keypress.
+        env.insert(QStringLiteral("APT_LISTCHANGES_FRONTEND"),
+                   QStringLiteral("none"));
         m_proc->setProcessEnvironment(env);
 
         QObject::connect(m_proc, &QProcess::readyReadStandardOutput, this,
@@ -1652,6 +1666,18 @@ public:
                              m_finished(ok);
                          });
 
+        // STDIN IS /dev/null — DO NOT CHANGE TO AN OPEN PIPE
+        // By default QProcess gives the child an open pipe for stdin and
+        // nothing is ever written to it. A pipe that is open but empty
+        // makes every read BLOCK FOREVER rather than returning end of
+        // file, so a single stray prompt anywhere in the install chain
+        // hangs the whole thing indefinitely and silently. /dev/null
+        // returns end of file immediately: the prompt fails, the error
+        // appears in the log, and the install carries on.
+        //
+        // The AlternixDE script is unaffected: install_desktop.sh feeds
+        // it its own answers through a separate process substitution.
+        m_proc->setStandardInputFile(QProcess::nullDevice());
         m_proc->start("bash", {QString(INSTALLER_DIR) + "/install.sh"});
     }
 

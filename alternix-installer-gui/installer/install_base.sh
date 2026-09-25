@@ -128,7 +128,19 @@ EOF
     echo ""
 
     # Update apt inside chroot first
-    _chroot "apt-get update -qq" 2>&1 | tee -a "$ALTERNIX_LOG"
+    # APT UPDATE: VISIBLE AND BOUNDED — DO NOT RESTORE -qq
+    # This used to be `apt-get update -qq`, which prints nothing at all
+    # while it works. An install sat here for over an hour with the
+    # screen showing no output, and there was no way to tell which
+    # repository it was waiting on. -q still suppresses progress bars
+    # but prints a Hit/Get line per repository, so a stall now names
+    # its culprit. timeout puts a hard ceiling on it: package lists are
+    # a convenience here, not a requirement, so on timeout the install
+    # continues with whatever lists already exist.
+    _chroot "timeout 300 apt-get update -q" 2>&1 | tee -a "$ALTERNIX_LOG"
+    if [[ ${PIPESTATUS[0]} -eq 124 ]]; then
+        warn "apt-get update timed out after 5 minutes; continuing with existing lists."
+    fi
 
     # Install kernel FIRST and separately — most critical package
     info "Installing linux-image-amd64..."
