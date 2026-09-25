@@ -944,6 +944,97 @@ fi
 HOOKEOF
 chmod +x config/hooks/normal/9999-fix-grub-kernel.hook.binary
 
+# ── 32-bit UEFI bootloader ────────────────────────────────────────
+# Bay Trail and Cherry Trail tablets commonly ship 64-bit CPUs with
+# 32-bit UEFI firmware. That firmware will only load EFI/BOOT/BOOTIA32.EFI
+# and ignores the 64-bit loader entirely, so those machines see the
+# stick as non-bootable.
+#
+# Drop the loader at efi/boot32.efi next to this script and it gets
+# built into the ISO. It goes to two places, because they are read in
+# different situations:
+#
+#   binary/EFI/BOOT/BOOTIA32.EFI   read when the stick was written by
+#                                  Rufus in ISO Image mode, where the
+#                                  firmware sees a FAT32 filesystem
+#
+#   boot/grub/efi.img              the embedded EFI system partition,
+#                                  read when the ISO was written with
+#                                  dd, where the ISO9660 tree is not a
+#                                  filesystem the firmware can boot
+#
+# The name matters: firmware looks for BOOTIA32.EFI specifically, so
+# the file is renamed on the way in whatever it is called on disk.
+_step "Checking for 32-bit UEFI loader"
+
+EFI32_SRC="${SCRIPT_DIR}/efi/boot32.efi"
+
+if [[ -f "$EFI32_SRC" ]]; then
+    mkdir -p config/includes.binary/EFI/BOOT
+    cp "$EFI32_SRC" config/includes.binary/EFI/BOOT/BOOTIA32.EFI
+    # Some grub.cfg files reference the original name, so keep a copy
+    # under it as well. Costs a few hundred kB.
+    cp "$EFI32_SRC" config/includes.binary/EFI/BOOT/boot32.efi
+    _ok "32-bit UEFI loader will be added as EFI/BOOT/BOOTIA32.EFI"
+
+    cat > config/hooks/normal/9998-efi32.hook.binary << 'HOOKEOF'
+#!/bin/sh
+# Inject the 32-bit loader into the embedded EFI system partition.
+# Binary hooks run with cwd = the ISO binary/ directory, after
+# binary_grub-efi has created boot/grub/efi.img and before the ISO is
+# assembled, which is the only window where that image can be edited.
+#
+# Without this the loader is present for Rufus ISO-mode sticks but
+# missing for dd-written ones, because dd-written media boot from
+# efi.img rather than from the ISO9660 tree.
+set -e
+
+# SOURCE IS boot32.efi, NOT BOOTIA32.EFI — DELIBERATE
+# live-build runs binary_includes BEFORE binary_grub-efi, and
+# binary_grub-efi may write its own bootia32.efi over ours. Our copy is
+# also placed under the original name, which live-build never touches,
+# so this hook reads from there and overwrites BOOTIA32.EFI afterwards.
+# That guarantees the loader that ends up on the stick is yours.
+SRC="EFI/BOOT/boot32.efi"
+IMG="boot/grub/efi.img"
+
+[ -f "$SRC" ] || { echo "efi32: $SRC not present, skipping"; exit 0; }
+
+# Re-assert it in the ISO tree, in case binary_grub-efi replaced it.
+cp "$SRC" EFI/BOOT/BOOTIA32.EFI
+echo "efi32: EFI/BOOT/BOOTIA32.EFI set from $SRC"
+
+[ -f "$IMG" ] || { echo "efi32: $IMG not found, skipping"; exit 0; }
+
+# mtools is installed by binary_grub-efi and removed again straight
+# after, so it usually has to be brought back for this one command.
+if ! command -v mcopy >/dev/null 2>&1; then
+    apt-get install -y mtools >/dev/null 2>&1 || true
+fi
+
+if command -v mcopy >/dev/null 2>&1; then
+    mmd -i "$IMG" ::/EFI 2>/dev/null || true
+    mmd -i "$IMG" ::/EFI/BOOT 2>/dev/null || true
+    if mcopy -o -i "$IMG" "$SRC" ::/EFI/BOOT/BOOTIA32.EFI 2>/dev/null; then
+        echo "efi32: BOOTIA32.EFI added to $IMG"
+    else
+        echo "efi32: WARNING could not write to $IMG."
+        echo "efi32: dd-written media will not boot on 32-bit UEFI."
+        echo "efi32: Rufus ISO-mode media are unaffected."
+    fi
+    mdir -i "$IMG" ::/EFI/BOOT 2>/dev/null || true
+else
+    echo "efi32: WARNING mtools unavailable, could not patch $IMG."
+fi
+HOOKEOF
+    chmod +x config/hooks/normal/9998-efi32.hook.binary
+else
+    mkdir -p "${SCRIPT_DIR}/efi"
+    _info "No 32-bit UEFI loader at ${EFI32_SRC}."
+    _info "Machines with 32-bit UEFI firmware will not boot this ISO."
+    _info "Put the loader there and rebuild to include it."
+fi
+
 # ── Build ─────────────────────────────────────────────────────────
 _step "Building ISO (this will take a while...)"
 

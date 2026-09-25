@@ -336,6 +336,20 @@ EOF
 // Temporary, removed at the end of the install by untune_target_dpkg.
 Acquire::Languages "none";
 DPkg::Use-Pty "false";
+
+// DOWNLOAD TIMEOUTS — the most likely reason an install appears to
+// hang forever with no output. A stalled TCP connection to a mirror is
+// far more likely behind a VM's NAT than on real hardware, and without
+// a timeout the download waits indefinitely while printing nothing.
+// That is indistinguishable from a crash. With these set, a stalled
+// connection fails and is retried instead.
+//
+// nala reads apt's configuration for acquire settings, so this covers
+// the AlternixDE package install as well as plain apt.
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+Acquire::ftp::Timeout "30";
+Acquire::Retries "3";
 EOF
 
     info "Package unpacking tuned for install speed."

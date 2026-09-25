@@ -19,6 +19,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QFont>
@@ -1578,9 +1579,21 @@ public:
         m_sub->hide();
         body()->addWidget(m_sub);
 
+        QHBoxLayout *statRow = new QHBoxLayout;
         m_errors = mkLabel(QStringLiteral("Errors: 0"), 15, FG_DIM);
         m_errors->setFont(QFont(QStringLiteral("DejaVu Sans")));
-        body()->addWidget(m_errors);
+        statRow->addWidget(m_errors);
+        statRow->addStretch(1);
+
+        // STALL INDICATOR
+        // An install that has produced no output for several minutes
+        // looks exactly like one that has crashed. Showing elapsed time
+        // and time-since-last-output turns "it hung for hours" into a
+        // number that says where it stopped.
+        m_stall = mkLabel(QString(), 15, FG_DIM);
+        m_stall->setFont(QFont(QStringLiteral("DejaVu Sans")));
+        statRow->addWidget(m_stall);
+        body()->addLayout(statRow);
 
         m_log = new QPlainTextEdit;
         m_log->setReadOnly(true);
@@ -1600,6 +1613,12 @@ public:
         m_log->clear();
         m_errorCount = 0;
         m_errors->setText(QStringLiteral("Errors: 0"));
+
+        m_started.start();
+        m_lastOutput.start();
+        QTimer *tick = new QTimer(this);
+        QObject::connect(tick, &QTimer::timeout, this, [this]() { updateStall(); });
+        tick->start(5000);
 
         m_proc = new QProcess(this);
         m_proc->setProcessChannelMode(QProcess::MergedChannels);
@@ -1639,7 +1658,28 @@ public:
     int errorCount() const { return m_errorCount; }
 
 private:
+    void updateStall() {
+        const qint64 total = m_started.elapsed() / 1000;
+        const qint64 idle  = m_lastOutput.elapsed() / 1000;
+        const QString elapsed = QString("Elapsed %1:%2")
+            .arg(total / 60, 2, 10, QChar('0')).arg(total % 60, 2, 10, QChar('0'));
+
+        if (idle < 90) {
+            m_stall->setText(elapsed);
+            m_stall->setStyleSheet(QString("color: %1; font-size: 15px;").arg(FG_DIM));
+            return;
+        }
+        // Still running, just quiet. Large downloads and long compiles
+        // legitimately go minutes without printing anything.
+        m_stall->setText(QString("%1   ·   no output for %2m %3s")
+                             .arg(elapsed).arg(idle / 60).arg(idle % 60));
+        m_stall->setStyleSheet(
+            QString("color: %1; font-size: 15px;")
+                .arg(idle > 600 ? DANGER : "#d9a34f"));
+    }
+
     void drain() {
+        m_lastOutput.restart();
         m_pending += QString::fromUtf8(m_proc->readAllStandardOutput());
         int nl;
         while ((nl = m_pending.indexOf('\n')) >= 0) {
@@ -1681,7 +1721,14 @@ private:
                 QString("color: %1; font-size: 15px; font-weight: 600;").arg(DANGER));
         }
         if (line.trimmed().isEmpty()) return;
-        m_log->appendHtml(logLineToHtml(line));
+        // Elapsed-time prefix: without it the saved log gives no way to
+        // tell a slow step from a stalled one.
+        const qint64 t = m_started.elapsed() / 1000;
+        const QString stamp = QString("%1:%2  ")
+            .arg(t / 60, 2, 10, QChar('0')).arg(t % 60, 2, 10, QChar('0'));
+        m_log->appendHtml(
+            QString("<span style=\"color:#6a6a6a\">%1</span>%2")
+                .arg(stamp, logLineToHtml(line)));
         m_log->verticalScrollBar()->setValue(m_log->verticalScrollBar()->maximum());
     }
 
@@ -1692,6 +1739,9 @@ private:
     QLabel      *m_errors = nullptr;
     QPlainTextEdit *m_log = nullptr;
     QString      m_pending;
+    QLabel      *m_stall  = nullptr;
+    QElapsedTimer m_started;
+    QElapsedTimer m_lastOutput;
     int          m_errorCount = 0;
     std::function<void(bool)> m_finished;
 };
