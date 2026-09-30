@@ -96,7 +96,7 @@ struct Answers {
     QString username, password, hostname = "alternix";
     QString timezone = "Europe/London", locale = "en_GB.UTF-8";
     QString desktop  = "alternix";
-    bool    telephony = false;
+    QStringList optional;   // ids of selected optional components
     QString targetDisk, targetDiskSize, targetDiskModel;
     bool    useSwap  = true;
     int     swapMb   = 2048;
@@ -469,6 +469,16 @@ public:
         m_network = makePill();
         h->addWidget(m_network);
 
+        // NETWORK ACTIVITY
+        // Live download rate, so it is obvious whether a long stage is
+        // actually fetching packages or has stalled. It complements the
+        // "no output for" counter on the progress page: silence with
+        // traffic flowing means a quiet download; silence with none
+        // means something is stuck.
+        m_rate = makePill();
+        m_rate->setMinimumWidth(118);
+        h->addWidget(m_rate);
+
         m_battery = makePill();
         h->addWidget(m_battery);
 
@@ -482,6 +492,13 @@ public:
         QObject::connect(t, &QTimer::timeout, this, [this]() { refresh(); });
         t->start(10000);
         refresh();
+
+        // The rate needs a finer interval to be meaningful. Reading one
+        // small /proc file a second costs effectively nothing.
+        QTimer *nt = new QTimer(this);
+        QObject::connect(nt, &QTimer::timeout, this, [this]() { sampleRate(); });
+        nt->start(1000);
+        sampleRate();
     }
 
     void setOnKeyboardToggled(std::function<void(bool)> fn) {
@@ -519,6 +536,69 @@ public:
     }
 
 private:
+    // Sum received and sent bytes over every interface except loopback.
+    // Loopback is excluded because local traffic is not download work.
+    static bool readNetBytes(quint64 &rx, quint64 &tx) {
+        rx = tx = 0;
+        // readProcLines, not QTextStream: /proc files report size 0 and
+        // an atEnd() loop reads nothing. See readProcLines.
+        const QStringList lines = readProcLines(QStringLiteral("/proc/net/dev"));
+        bool any = false;
+        for (const QString &line : lines) {
+            const int colon = line.indexOf(':');
+            if (colon < 0) continue;                    // header rows
+            const QString iface = line.left(colon).trimmed();
+            if (iface == QStringLiteral("lo")) continue;
+            const QStringList f = line.mid(colon + 1)
+                .split(QRegularExpression(QStringLiteral("\\s+")),
+                       Qt::SkipEmptyParts);
+            if (f.size() < 9) continue;
+            rx += f[0].toULongLong();                   // receive bytes
+            tx += f[8].toULongLong();                   // transmit bytes
+            any = true;
+        }
+        return any;
+    }
+
+    static QString fmtRate(double bytesPerSec) {
+        if (bytesPerSec < 1024.0)
+            return QString("%1 B/s").arg(static_cast<int>(bytesPerSec));
+        if (bytesPerSec < 1024.0 * 1024.0)
+            return QString("%1 KB/s").arg(bytesPerSec / 1024.0, 0, 'f', 0);
+        return QString("%1 MB/s").arg(bytesPerSec / (1024.0 * 1024.0), 0, 'f', 1);
+    }
+
+    void sampleRate() {
+        quint64 rx = 0, tx = 0;
+        if (!readNetBytes(rx, tx)) {
+            m_rate->setText(QString::fromUtf8("\u2193 --"));
+            stylePill(m_rate, FG_DIM);
+            return;
+        }
+        const qint64 ms = m_rateClock.isValid() ? m_rateClock.restart() : 0;
+        if (!m_rateClock.isValid()) m_rateClock.start();
+
+        // First sample, or a counter that went backwards (interface
+        // reset): nothing meaningful to show yet.
+        if (ms <= 0 || rx < m_rxPrev) {
+            m_rxPrev = rx;
+            m_txPrev = tx;
+            m_rate->setText(QString::fromUtf8("\u2193 --"));
+            stylePill(m_rate, FG_DIM);
+            return;
+        }
+
+        const double down = (rx - m_rxPrev) * 1000.0 / ms;
+        m_rxPrev = rx;
+        m_txPrev = tx;
+
+        // Under ~2 KB/s is background chatter (DHCP, ARP), not a download.
+        const bool active = down >= 2048.0;
+        m_rate->setText(QString::fromUtf8("\u2193 ") +
+                        (active ? fmtRate(down) : QStringLiteral("idle")));
+        stylePill(m_rate, active ? OKGREEN : FG_DIM);
+    }
+
     // Rounded pill, matching the keyboard button.
     QLabel *makePill() {
         QLabel *l = new QLabel(this);
@@ -569,6 +649,10 @@ private:
 
     QPushButton *m_kbBtn   = nullptr;
     QLabel      *m_network = nullptr;
+    QLabel      *m_rate    = nullptr;
+    QElapsedTimer m_rateClock;
+    quint64      m_rxPrev  = 0;
+    quint64      m_txPrev  = 0;
     QLabel      *m_battery = nullptr;
     QLabel      *m_clock   = nullptr;
 };
@@ -1426,28 +1510,13 @@ public:
             body()->addWidget(card);
         }
 
-        body()->addSpacing(10);
-        // Asked here because the AlternixDE script prompts for it
-        // half an hour into its own run, where nobody is watching.
-        m_telephony = new QCheckBox(
-            QStringLiteral("Install mobile telephony (plasma-dialer, spacebar)"));
-        m_telephony->setStyleSheet(
-            QString("QCheckBox { color: %1; font-size: 16px; spacing: 12px; }"
-                    "QCheckBox::indicator { width: 26px; height: 26px; }").arg(FG));
-        body()->addWidget(m_telephony);
-        body()->addWidget(mkLabel(
-            QStringLiteral("Only useful on a phone or tablet with a modem. "
-                           "Adds KDE dialer applications."), 14, FG_DIM));
 
         body()->addStretch(1);
 
         QPushButton *b = mkButton(QStringLiteral("Back"));
         QPushButton *n = mkButton(QStringLiteral("Next"), true);
         QObject::connect(b, &QPushButton::clicked, this, back);
-        QObject::connect(n, &QPushButton::clicked, this, [this, next]() {
-            g_ans.telephony = m_telephony->isChecked();
-            next();
-        });
+        QObject::connect(n, &QPushButton::clicked, this, next);
         footer()->addWidget(b);
         footer()->addStretch(1);
         footer()->addWidget(n);
@@ -1455,8 +1524,146 @@ public:
 
 private:
     QList<ClickableCard *> m_cards;
-    QCheckBox *m_telephony = nullptr;
 };
+
+// ═══════════════════════════════════════════════════════════════
+// 6b. Optional components
+//
+// ADDING A COMPONENT — two steps, nothing else to change:
+//
+//   1. Add a row to OPTIONAL_COMPONENTS below.
+//   2. Add installer/optional/<id>.sh, which is run inside the target
+//      after the desktop is installed. It gets TARGET_USER and HOME set
+//      and stdin connected to /dev/null, so it must not prompt.
+//
+// The page, the config file and the summary all pick the new row up
+// automatically. If the script is missing, the install warns and skips
+// that component rather than failing.
+//
+// alternixOnly hides a component unless AlternixDE is the chosen
+// desktop, for things that depend on it.
+// ═══════════════════════════════════════════════════════════════
+struct OptionalComponent {
+    const char *id;
+    const char *name;
+    const char *desc;
+    bool        alternixOnly;
+};
+
+static const OptionalComponent OPTIONAL_COMPONENTS[] = {
+    {"telephony", "Mobile telephony",
+     "Phone calls and SMS through a built-in cellular modem, using "
+     "plasma-dialer and spacebar. Only useful on devices that have one.",
+     true},
+    // {"steam",     "Steam",     "Valve's game store and launcher.", false},
+    // {"retrodeck", "RetroDECK", "Retro gaming emulation frontend.", false},
+};
+
+class OptionalPage : public Page {
+public:
+    OptionalPage(std::function<void()> back, std::function<void()> next)
+        : Page(QStringLiteral("Optional components"),
+               QStringLiteral("Extra software you can add now. "
+                              "Everything here can also be installed later.")) {
+
+        for (const OptionalComponent &c : OPTIONAL_COMPONENTS) {
+            ClickableCard *card = new ClickableCard;
+            QHBoxLayout *row = new QHBoxLayout(card);
+            row->setContentsMargins(18, 14, 18, 14);
+            row->setSpacing(16);
+
+            // A visible tick box, so it reads as a toggle rather than
+            // a single choice like the desktop cards on the page before.
+            QLabel *tick = new QLabel;
+            tick->setFixedSize(30, 30);
+            tick->setAlignment(Qt::AlignCenter);
+            row->addWidget(tick, 0, Qt::AlignTop);
+
+            QVBoxLayout *text = new QVBoxLayout;
+            text->setSpacing(4);
+            text->addWidget(mkLabel(QString::fromUtf8(c.name), 19, FG, true));
+            text->addWidget(mkLabel(QString::fromUtf8(c.desc), 15, FG_DIM));
+            row->addLayout(text, 1);
+
+            const QString id = QString::fromUtf8(c.id);
+            Entry e{card, tick, id, c.alternixOnly};
+            m_entries.append(e);
+            setTick(e, false);
+
+            card->setOnClick([this, id]() { toggle(id); });
+            body()->addWidget(card);
+        }
+
+        m_note = mkLabel(QString(), 14, FG_DIM);
+        body()->addWidget(m_note);
+        body()->addStretch(1);
+
+        QPushButton *b = mkButton(QStringLiteral("Back"));
+        QPushButton *n = mkButton(QStringLiteral("Next"), true);
+        QObject::connect(b, &QPushButton::clicked, this, back);
+        QObject::connect(n, &QPushButton::clicked, this, [this, next]() {
+            g_ans.optional.clear();
+            for (const Entry &e : m_entries)
+                if (e.selected && e.card->isVisible()) g_ans.optional << e.id;
+            next();
+        });
+        footer()->addWidget(b);
+        footer()->addStretch(1);
+        footer()->addWidget(n);
+    }
+
+    // Re-evaluated on every visit: the desktop choice may have changed.
+    void onEnter() override {
+        const bool alternix = (g_ans.desktop == QStringLiteral("alternix"));
+        int hidden = 0;
+        for (Entry &e : m_entries) {
+            const bool show = alternix || !e.alternixOnly;
+            e.card->setVisible(show);
+            if (!show) ++hidden;
+        }
+        m_note->setText(hidden > 0
+            ? QStringLiteral("Some components are only available with the "
+                             "Alternix desktop and are hidden.")
+            : QString());
+    }
+
+private:
+    struct Entry {
+        ClickableCard *card;
+        QLabel        *tick;
+        QString        id;
+        bool           alternixOnly;
+        bool           selected = false;
+    };
+
+    void toggle(const QString &id) {
+        for (Entry &e : m_entries) {
+            if (e.id != id) continue;
+            e.selected = !e.selected;
+            setTick(e, e.selected);
+            e.card->setSelected(e.selected);
+        }
+    }
+
+    static void setTick(Entry &e, bool on) {
+        e.tick->setText(on ? QString::fromUtf8("\u2713") : QString());
+        e.tick->setStyleSheet(QString(
+            "QLabel { border: 2px solid %1; border-radius: 6px;"
+            "  background: %2; color: #ffffff; font-size: 18px;"
+            "  font-weight: 700; }")
+            .arg(on ? ACCENT : "#5a5a5a", on ? ACCENT : "transparent"));
+    }
+
+    QList<Entry> m_entries;
+    QLabel      *m_note = nullptr;
+};
+
+// Display name for an optional component id, for the summary page.
+static QString optionalName(const QString &id) {
+    for (const OptionalComponent &c : OPTIONAL_COMPONENTS)
+        if (id == QString::fromUtf8(c.id)) return QString::fromUtf8(c.name);
+    return id;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // 7. Summary
@@ -1517,9 +1724,11 @@ public:
         addRow(QStringLiteral("Timezone"),  g_ans.timezone);
         addRow(QStringLiteral("Language"),  g_ans.locale);
         addRow(QStringLiteral("Desktop"),   g_ans.desktop);
-        addRow(QStringLiteral("Telephony"),
-               g_ans.telephony ? QStringLiteral("Install")
-                               : QStringLiteral("Skip"));
+        QStringList optNames;
+        for (const QString &id : g_ans.optional) optNames << optionalName(id);
+        addRow(QStringLiteral("Optional"),
+               optNames.isEmpty() ? QStringLiteral("None")
+                                  : optNames.join(QStringLiteral(", ")));
         addRow(QStringLiteral("Network"),
                g_ans.netSsid.isEmpty()
                    ? (g_ans.netIface.isEmpty() ? QStringLiteral("Already connected")
@@ -2044,9 +2253,17 @@ static bool writeConf(QString *errOut) {
     ts << "ALTERNIX_TIMEZONE=" << shQuote(g_ans.timezone) << "\n";
     ts << "ALTERNIX_LOCALE="   << shQuote(g_ans.locale)   << "\n";
     ts << "ALTERNIX_DESKTOP="  << shQuote(g_ans.desktop)  << "\n";
-    // 1 = install, 2 = skip. Matches the answers the AlternixDE
-    // script expects at its own telephony prompt.
-    ts << "ALTERNIX_TELEPHONY=" << (g_ans.telephony ? "1" : "2") << "\n";
+    // Telephony is answered through the AlternixDE script's own prompt
+    // (1 = install, 2 = skip), so it is written separately and left
+    // out of the generic list below.
+    ts << "ALTERNIX_TELEPHONY="
+       << (g_ans.optional.contains(QStringLiteral("telephony")) ? "1" : "2")
+       << "\n";
+
+    // Everything else is installed by installer/optional/<id>.sh.
+    QStringList generic = g_ans.optional;
+    generic.removeAll(QStringLiteral("telephony"));
+    ts << "ALTERNIX_OPTIONAL=" << shQuote(generic.join(' ')) << "\n";
     ts << "TARGET_DISK="       << shQuote(g_ans.targetDisk) << "\n";
     ts << "PART_MODE='guided'\n";
     ts << "USE_SWAP=" << (g_ans.useSwap ? 1 : 0) << "\n";
@@ -2099,26 +2316,40 @@ public:
         QObject::connect(m_stack, &QStackedWidget::currentChanged, this,
                          [this](int) { m_taskbar->refreshNetwork(); });
 
-        auto go = [this](int i) { navigate(i); };
-
-        m_welcome  = new WelcomePage([go]() { go(1); },
-                                     []() { QApplication::quit(); });
-        m_hardware = new HardwarePage([go]() { go(0); }, [go]() { go(2); });
-        m_network  = new NetworkPage ([go]() { go(1); }, [go]() { go(3); });
-        m_user     = new UserPage    ([go]() { go(2); }, [go]() { go(4); });
-        m_disk     = new DiskPage    ([go]() { go(3); }, [go]() { go(5); });
-        m_desktop  = new DesktopPage ([go]() { go(4); }, [go]() { go(6); });
-        m_summary  = new SummaryPage ([go]() { go(5); }, [this]() { beginInstall(); });
+        // NAVIGATION BY PAGE, NOT BY INDEX — DO NOT GO BACK TO NUMBERS
+        // Pages used to be addressed as go(6), go(7) and so on. Inserting
+        // a page meant renumbering every call after it, and a missed one
+        // sent the user to the wrong screen. Each lambda now names the
+        // page it goes to. The members are read when the button is
+        // pressed, not when the lambda is made, so it does not matter
+        // that later pages are not constructed yet at this point.
+        m_welcome  = new WelcomePage ([this]() { navigate(m_hardware); },
+                                      []() { QApplication::quit(); });
+        m_hardware = new HardwarePage([this]() { navigate(m_welcome); },
+                                      [this]() { navigate(m_network); });
+        m_network  = new NetworkPage ([this]() { navigate(m_hardware); },
+                                      [this]() { navigate(m_user); });
+        m_user     = new UserPage    ([this]() { navigate(m_network); },
+                                      [this]() { navigate(m_disk); });
+        m_disk     = new DiskPage    ([this]() { navigate(m_user); },
+                                      [this]() { navigate(m_desktop); });
+        m_desktop  = new DesktopPage ([this]() { navigate(m_disk); },
+                                      [this]() { navigate(m_optional); });
+        m_optional = new OptionalPage([this]() { navigate(m_desktop); },
+                                      [this]() { navigate(m_summary); });
+        m_summary  = new SummaryPage ([this]() { navigate(m_optional); },
+                                      [this]() { beginInstall(); });
         m_progress = new ProgressPage([this](bool ok) { onFinished(ok); });
         m_done     = new FinishedPage();
 
-        m_terminal = new TerminalPage([go]() { go(8); });
-        m_done->setOnTerminal([go]() { go(9); });
+        m_terminal = new TerminalPage([this]() { navigate(m_done); });
+        m_done->setOnTerminal([this]() { navigate(m_terminal); });
 
         m_pages = {m_welcome, m_hardware, m_network, m_user, m_disk,
-                   m_desktop, m_summary, m_progress, m_done, m_terminal};
+                   m_desktop, m_optional, m_summary, m_progress, m_done,
+                   m_terminal};
         for (Page *p : m_pages) m_stack->addWidget(p);
-        navigate(0);
+        navigate(m_welcome);
     }
 
 protected:
@@ -2130,12 +2361,10 @@ protected:
     }
 
 private:
-    void navigate(int index) {
-        m_stack->setCurrentIndex(index);
-        // NOT qobject_cast: Page has no Q_OBJECT macro (no moc in this
-        // build), so qobject_cast would fail its static_assert. Keep an
-        // explicit list instead.
-        if (index >= 0 && index < m_pages.size()) m_pages[index]->onEnter();
+    void navigate(Page *page) {
+        if (!page) return;
+        m_stack->setCurrentWidget(page);
+        page->onEnter();
     }
 
     void beginInstall() {
@@ -2147,7 +2376,7 @@ private:
         m_installing = true;
         m_kb->setAutoShow(false);
         m_kb->hide();
-        navigate(7);
+        navigate(m_progress);
         m_progress->start();
     }
 
@@ -2156,7 +2385,7 @@ private:
         // The clear-text password must not outlive the install.
         QFile::remove(CONF_PATH);
         m_done->setResult(ok, m_progress->errorCount());
-        navigate(8);
+        navigate(m_done);
     }
 
     QStackedWidget *m_stack   = nullptr;
@@ -2168,6 +2397,7 @@ private:
     UserPage       *m_user    = nullptr;
     DiskPage       *m_disk    = nullptr;
     DesktopPage    *m_desktop = nullptr;
+    OptionalPage   *m_optional= nullptr;
     SummaryPage    *m_summary = nullptr;
     ProgressPage   *m_progress= nullptr;
     FinishedPage   *m_done    = nullptr;

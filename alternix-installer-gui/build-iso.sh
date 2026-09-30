@@ -13,6 +13,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
+
+# ── Package mirror used to BUILD the ISO ──────────────────────────
+# deb.devuan.org is a round-robin across all Devuan mirrors, which is what
+# Devuan asks people to use. Occasionally it hands out a mirror whose
+# Release file does not match its own package lists, and apt then fails
+# with "File has unexpected size ... Mirror sync in progress?". It can
+# keep handing out the same broken mirror, so rerunning does not always
+# help. To pin a specific mirror for one build:
+#
+#   DEVUAN_MIRROR=http://ftp.fau.de/devuan/merged ./build-iso.sh
+#
+# Any "BaseURL" from Devuan's mirror list works, with /merged appended.
+# This affects only the ISO build and the live session. Installed
+# systems get their own sources.list from configure_system.sh, which
+# always uses deb.devuan.org, so pinning here never reaches a user.
+DEVUAN_MIRROR="${DEVUAN_MIRROR:-http://deb.devuan.org/merged}"
 OUTPUT_ISO="${SCRIPT_DIR}/alternix-installer.iso"
 
 # ── Colours (minimal, build-time only) ───────────────────────────
@@ -127,10 +143,10 @@ _step "Configuring live-build"
 lb config \
     --distribution "excalibur" \
     --archive-areas "main contrib non-free non-free-firmware" \
-    --mirror-bootstrap "http://deb.devuan.org/merged" \
-    --mirror-binary "http://deb.devuan.org/merged" \
-    --mirror-chroot-security "http://deb.devuan.org/merged" \
-    --mirror-binary-security "http://deb.devuan.org/merged" \
+    --mirror-bootstrap "$DEVUAN_MIRROR" \
+    --mirror-binary "$DEVUAN_MIRROR" \
+    --mirror-chroot-security "$DEVUAN_MIRROR" \
+    --mirror-binary-security "$DEVUAN_MIRROR" \
     --architectures "amd64" \
     --binary-images "iso-hybrid" \
     --bootloaders "grub-efi,grub-pc" \
@@ -143,6 +159,7 @@ lb config \
     --iso-publisher "Alternix" \
     --apt-indices "false" \
     --apt-recommends "false" \
+    --apt-source-archives "false" \
     "${COMPRESSION_ARG[@]}" \
     --debootstrap-options "--variant=minbase --keyring=${DEVUAN_KEYRING}"
 
@@ -154,6 +171,26 @@ _ok "live-build configured."
 # Set LB_INITSYSTEM=none so live-build does not try to install live-config-systemd.
 # We add live-config-sysvinit explicitly in our package list instead.
 echo 'LB_INITSYSTEM="none"' >> config/common
+
+# NO SOURCE PACKAGE INDICES — DO NOT RE-ENABLE
+# live-build defaults to adding deb-src lines, so every apt-get update in
+# the build also downloads the Sources indices. They are rewritten at
+# each stage, so main/Sources (10.6 MB) was fetched about seven times
+# per build — roughly 75 MB that nothing uses, since this build never
+# compiles Debian source packages. Each download is also another chance
+# of hitting a mirror mid-sync: a build failed on exactly that, with
+# "File has unexpected size ... Mirror sync in progress?" on a Sources
+# file. Written into the config file as well as passed as a flag, for
+# the same reason as the compression setting below.
+_src_set=0
+for _cf in config/common config/bootstrap config/chroot config/binary config/source; do
+    if grep -q '^LB_APT_SOURCE_ARCHIVES=' "$_cf" 2>/dev/null; then
+        sed -i 's|^LB_APT_SOURCE_ARCHIVES=.*|LB_APT_SOURCE_ARCHIVES="false"|' "$_cf"
+        _src_set=1
+    fi
+done
+[[ $_src_set -eq 0 ]] && echo 'LB_APT_SOURCE_ARCHIVES="false"' >> config/common
+_ok "Source package indices disabled."
 
 # FORCE THE SQUASHFS COMPRESSION — DO NOT RELY ON THE lb config FLAG
 # Passing --compression to lb config is accepted without error but does
@@ -944,96 +981,195 @@ fi
 HOOKEOF
 chmod +x config/hooks/normal/9999-fix-grub-kernel.hook.binary
 
-# ── 32-bit UEFI bootloader ────────────────────────────────────────
-# Bay Trail and Cherry Trail tablets commonly ship 64-bit CPUs with
-# 32-bit UEFI firmware. That firmware will only load EFI/BOOT/BOOTIA32.EFI
-# and ignores the 64-bit loader entirely, so those machines see the
-# stick as non-bootable.
+# ── EFI boot menu: Visor (64-bit) and your 32-bit loader ─────────
+# Two things go into the ISO's EFI directory here, and both must be
+# placed AFTER live-build has written its own GRUB loaders, which it does
+# in binary_grub-efi. binary_includes runs before that step, so anything
+# staged under config/includes.binary/EFI would be overwritten. Both are
+# therefore staged OUTSIDE the EFI tree and moved into place by a binary
+# hook, which live-build runs after binary_grub-efi.
 #
-# Drop the loader at efi/boot32.efi next to this script and it gets
-# built into the ISO. It goes to two places, because they are read in
-# different situations:
-#
-#   binary/EFI/BOOT/BOOTIA32.EFI   read when the stick was written by
-#                                  Rufus in ISO Image mode, where the
-#                                  firmware sees a FAT32 filesystem
-#
-#   boot/grub/efi.img              the embedded EFI system partition,
-#                                  read when the ISO was written with
-#                                  dd, where the ISO9660 tree is not a
-#                                  filesystem the firmware can boot
-#
-# The name matters: firmware looks for BOOTIA32.EFI specifically, so
-# the file is renamed on the way in whatever it is called on disk.
-_step "Checking for 32-bit UEFI loader"
+# ONE EFI BOOT DIRECTORY — THE BUG THIS AVOIDS
+# The ISO filesystem is case-sensitive; FAT32 is not. An earlier version
+# created EFI/BOOT alongside live-build's own directory. When Rufus copies
+# the ISO onto a FAT32 stick, EFI/BOOT and EFI/boot become the same
+# directory and whichever file is written last survives, which silently
+# discarded boot32.efi in favour of live-build's own 32-bit GRUB. The hook
+# now writes into whichever EFI boot directory already exists, and
+# matches the filename case of the 64-bit loader beside it.
+_step "Preparing EFI boot menu"
+
+EFI_STAGE="config/includes.binary/.alternix-efi"
+rm -rf "$EFI_STAGE"
+mkdir -p "$EFI_STAGE"
 
 EFI32_SRC="${SCRIPT_DIR}/efi/boot32.efi"
-
 if [[ -f "$EFI32_SRC" ]]; then
-    mkdir -p config/includes.binary/EFI/BOOT
-    cp "$EFI32_SRC" config/includes.binary/EFI/BOOT/BOOTIA32.EFI
-    # Some grub.cfg files reference the original name, so keep a copy
-    # under it as well. Costs a few hundred kB.
-    cp "$EFI32_SRC" config/includes.binary/EFI/BOOT/boot32.efi
-    _ok "32-bit UEFI loader will be added as EFI/BOOT/BOOTIA32.EFI"
-
-    cat > config/hooks/normal/9998-efi32.hook.binary << 'HOOKEOF'
-#!/bin/sh
-# Inject the 32-bit loader into the embedded EFI system partition.
-# Binary hooks run with cwd = the ISO binary/ directory, after
-# binary_grub-efi has created boot/grub/efi.img and before the ISO is
-# assembled, which is the only window where that image can be edited.
-#
-# Without this the loader is present for Rufus ISO-mode sticks but
-# missing for dd-written ones, because dd-written media boot from
-# efi.img rather than from the ISO9660 tree.
-set -e
-
-# SOURCE IS boot32.efi, NOT BOOTIA32.EFI — DELIBERATE
-# live-build runs binary_includes BEFORE binary_grub-efi, and
-# binary_grub-efi may write its own bootia32.efi over ours. Our copy is
-# also placed under the original name, which live-build never touches,
-# so this hook reads from there and overwrites BOOTIA32.EFI afterwards.
-# That guarantees the loader that ends up on the stick is yours.
-SRC="EFI/BOOT/boot32.efi"
-IMG="boot/grub/efi.img"
-
-[ -f "$SRC" ] || { echo "efi32: $SRC not present, skipping"; exit 0; }
-
-# Re-assert it in the ISO tree, in case binary_grub-efi replaced it.
-cp "$SRC" EFI/BOOT/BOOTIA32.EFI
-echo "efi32: EFI/BOOT/BOOTIA32.EFI set from $SRC"
-
-[ -f "$IMG" ] || { echo "efi32: $IMG not found, skipping"; exit 0; }
-
-# mtools is installed by binary_grub-efi and removed again straight
-# after, so it usually has to be brought back for this one command.
-if ! command -v mcopy >/dev/null 2>&1; then
-    apt-get install -y mtools >/dev/null 2>&1 || true
-fi
-
-if command -v mcopy >/dev/null 2>&1; then
-    mmd -i "$IMG" ::/EFI 2>/dev/null || true
-    mmd -i "$IMG" ::/EFI/BOOT 2>/dev/null || true
-    if mcopy -o -i "$IMG" "$SRC" ::/EFI/BOOT/BOOTIA32.EFI 2>/dev/null; then
-        echo "efi32: BOOTIA32.EFI added to $IMG"
-    else
-        echo "efi32: WARNING could not write to $IMG."
-        echo "efi32: dd-written media will not boot on 32-bit UEFI."
-        echo "efi32: Rufus ISO-mode media are unaffected."
-    fi
-    mdir -i "$IMG" ::/EFI/BOOT 2>/dev/null || true
-else
-    echo "efi32: WARNING mtools unavailable, could not patch $IMG."
-fi
-HOOKEOF
-    chmod +x config/hooks/normal/9998-efi32.hook.binary
+    cp "$EFI32_SRC" "${EFI_STAGE}/boot32.efi"
+    _ok "32-bit UEFI loader staged from ${EFI32_SRC}"
 else
     mkdir -p "${SCRIPT_DIR}/efi"
     _info "No 32-bit UEFI loader at ${EFI32_SRC}."
-    _info "Machines with 32-bit UEFI firmware will not boot this ISO."
-    _info "Put the loader there and rebuild to include it."
+    _info "Tablets with 32-bit UEFI firmware (Bay Trail, Cherry Trail)"
+    _info "will not boot this ISO. Put the loader there and rebuild."
 fi
+
+# Build Visor inside the chroot, where gnu-efi and gcc already are. The
+# result is kept at /usr/share/alternix/visor so it serves two purposes:
+# the ISO boot menu (via the binary hook below) and the installed system
+# (install_base.sh uses it instead of cloning and compiling at install
+# time, which previously failed whenever gnu-efi or the network did).
+cat > config/hooks/normal/0085-visor.hook.chroot << 'HOOKEOF'
+#!/bin/bash
+# Build the Visor boot manager. Non-fatal: if this fails the ISO keeps
+# live-build's GRUB as its boot menu and installs fall back to building
+# Visor on the target, as they did before.
+DEST=/usr/share/alternix/visor
+LOG=/tmp/visor-build.log
+rm -rf /tmp/visor-build "$DEST"
+
+echo "  · Building Visor boot manager..."
+if ! git clone --depth 1 -q https://github.com/IO-ZetZor/Visor-BootManager.git \
+        /tmp/visor-build >"$LOG" 2>&1; then
+    echo "  ! Visor clone failed — ISO will use GRUB."; tail -5 "$LOG"; exit 0
+fi
+
+# ARCH=x86_64 explicitly. Visor supports only x86_64 and aarch64; there
+# is no 32-bit UEFI build, so 32-bit tablets always boot via boot32.efi.
+if ! ( cd /tmp/visor-build && make ARCH=x86_64 ) >>"$LOG" 2>&1 || \
+   [ ! -f /tmp/visor-build/visor_x64.efi ]; then
+    echo "  ! Visor build failed — ISO will use GRUB. Last lines:"
+    tail -15 "$LOG" | sed 's/^/      /'
+    rm -rf /tmp/visor-build; exit 0
+fi
+
+mkdir -p "$DEST/icons" "$DEST/backgrounds"
+cp /tmp/visor-build/visor_x64.efi "$DEST/"
+cp /tmp/visor-build/assets/icons/*.png       "$DEST/icons/"       2>/dev/null || true
+cp /tmp/visor-build/assets/backgrounds/*.png "$DEST/backgrounds/" 2>/dev/null || true
+rm -rf /tmp/visor-build "$LOG"
+echo "  + Visor built ($(stat -c %s "$DEST/visor_x64.efi") bytes)."
+HOOKEOF
+chmod +x config/hooks/normal/0085-visor.hook.chroot
+
+cat > config/hooks/normal/9998-alternix-efi.hook.binary << 'HOOKEOF'
+#!/bin/sh
+# Runs in binary/ after binary_grub-efi, before the ISO is assembled.
+STAGE=".alternix-efi"
+VISOR="../chroot/usr/share/alternix/visor"
+
+# Find live-build's EFI boot directory, whatever case it used. Everything
+# goes in here so there is only ever one directory once on FAT32.
+BOOTDIR=$(find EFI -maxdepth 1 -type d -iname boot 2>/dev/null | head -1)
+if [ -z "$BOOTDIR" ]; then mkdir -p EFI/boot; BOOTDIR="EFI/boot"; fi
+if [ "$(find EFI -maxdepth 1 -type d -iname boot | wc -l)" -gt 1 ]; then
+    echo "efi: WARNING more than one EFI boot directory; they will collide on FAT32"
+fi
+
+# Match the case of the 64-bit loader already in that directory.
+X64=$(find "$BOOTDIR" -maxdepth 1 -type f -iname bootx64.efi | head -1)
+case "$(basename "${X64:-bootx64.efi}")" in
+    BOOTX64.EFI) N32="BOOTIA32.EFI"; N64="BOOTX64.EFI" ;;
+    *)           N32="bootia32.efi"; N64="bootx64.efi" ;;
+esac
+echo "efi: boot directory is $BOOTDIR"
+
+# ── 32-bit loader ─────────────────────────────────────────────────
+if [ -f "$STAGE/boot32.efi" ]; then
+    # Remove every existing 32-bit loader in any case, then place ours.
+    find "$BOOTDIR" -maxdepth 1 -type f -iname bootia32.efi -exec rm -f {} +
+    cp "$STAGE/boot32.efi" "$BOOTDIR/$N32"
+    cp "$STAGE/boot32.efi" "$BOOTDIR/boot32.efi"
+    echo "efi: 32-bit loader installed as $BOOTDIR/$N32"
+
+    # Also into the embedded EFI partition read by dd-written media.
+    # FAT is case-insensitive, so this overwrites live-build's copy
+    # whatever case it has there.
+    if [ -f boot/grub/efi.img ]; then
+        command -v mcopy >/dev/null 2>&1 || apt-get install -y mtools >/dev/null 2>&1 || true
+        if command -v mcopy >/dev/null 2>&1; then
+            mmd -i boot/grub/efi.img ::/EFI      2>/dev/null || true
+            mmd -i boot/grub/efi.img ::/EFI/BOOT 2>/dev/null || true
+            if mcopy -o -i boot/grub/efi.img "$STAGE/boot32.efi" ::/EFI/BOOT/BOOTIA32.EFI; then
+                echo "efi: 32-bit loader installed into boot/grub/efi.img"
+            else
+                echo "efi: WARNING could not write efi.img; dd-written media will not boot 32-bit UEFI"
+            fi
+        fi
+    fi
+fi
+
+# ── Visor as the 64-bit boot menu ─────────────────────────────────
+# Visor reads kernels from the FAT volume it booted from. On a stick
+# written by Rufus in ISO Image mode that volume holds \live\vmlinuz,
+# so Visor boots the live system directly. On a dd-written stick the
+# firmware boots boot/grub/efi.img instead, which does not contain the
+# kernel, so efi.img is deliberately left running GRUB.
+if [ -f "$VISOR/visor_x64.efi" ]; then
+    mkdir -p EFI/visor/icons EFI/visor/backgrounds
+    cp "$VISOR/visor_x64.efi" EFI/visor/
+    cp "$VISOR/icons/"*.png       EFI/visor/icons/       2>/dev/null || true
+    cp "$VISOR/backgrounds/"*.png EFI/visor/backgrounds/ 2>/dev/null || true
+
+    BG=""
+    if [ -f ../chroot/boot/grub/background.png ]; then
+        cp ../chroot/boot/grub/background.png EFI/visor/backgrounds/alternix.png
+        BG='background=\EFI\visor\backgrounds\alternix.png'
+    fi
+
+    # Keep GRUB as a menu entry rather than discarding it, so any
+    # machine Visor struggles with still has a way in.
+    GRUB_BACKUP=""
+    if [ -n "$X64" ] && [ -f "$X64" ]; then
+        mv "$X64" "$BOOTDIR/grubx64-alternix.efi"
+        GRUB_BACKUP="\\$(printf '%s' "$BOOTDIR" | tr '/' '\\')\\grubx64-alternix.efi"
+    fi
+    cp "$VISOR/visor_x64.efi" "$BOOTDIR/$N64"
+
+    # PRINTF, NEVER ECHO — DO NOT CHANGE
+    # This hook runs under /bin/sh, which is dash, and dash's echo
+    # interprets backslash escapes. Visor paths are full of backslashes:
+    # "\live\vmlinuz" had its \v turned into a vertical tab, and "\boot"
+    # into a backspace, so every entry pointed at a file that does not
+    # exist. printf '%s\n' prints its argument exactly as given.
+    CMD="boot=live components live-config.username=root live-config.autologin=root pci=noaer"
+    KERN='\live\vmlinuz'
+    INITRD='\live\initrd.img'
+
+    entry() {  # $1 name, $2 extra cmdline
+        printf '%s\n' "" "entry {" \
+            "    name    = \"$1\"" \
+            "    kernel  = $KERN" \
+            "    initrd  = $INITRD" \
+            "    cmdline = \"$CMD $2\"" \
+            "}"
+    }
+
+    {
+        printf '%s\n' "timeout=5" "default=0" "title=Alternix Installer"
+        [ -n "$BG" ] && printf '%s\n' "$BG"
+        entry "Install Alternix"                   "quiet"
+        entry "Install Alternix (text mode)"       "alternix.tui=1 quiet"
+        entry "Install Alternix (nomodeset)"       "nomodeset"
+        entry "Install Alternix (safe mode, text)" "alternix.tui=1 noapic noacpi nomodeset"
+        if [ -n "$GRUB_BACKUP" ]; then
+            printf '%s\n' "" \
+                "# A PE image with no initrd or cmdline is chainloaded." \
+                "entry {" \
+                "    name    = \"GRUB menu (fallback)\"" \
+                "    kernel  = $GRUB_BACKUP" \
+                "}"
+        fi
+    } > EFI/visor/boot.conf
+    echo "efi: Visor installed as $BOOTDIR/$N64 (GRUB kept as a menu entry)"
+else
+    echo "efi: Visor not built; the ISO keeps live-build's GRUB menu."
+fi
+
+rm -rf "$STAGE"
+HOOKEOF
+chmod +x config/hooks/normal/9998-alternix-efi.hook.binary
+_ok "EFI boot menu hook written."
 
 # ── Build ─────────────────────────────────────────────────────────
 _step "Building ISO (this will take a while...)"
@@ -1044,6 +1180,25 @@ lb build 2>&1 | tee "$LB_LOG" | while IFS= read -r line; do
 done
 # tee exits 0 — check the log for lb failure marker instead
 if grep -qE "^E:|^lb build failed" "$LB_LOG" 2>/dev/null; then
+    # A broken or mid-sync mirror is the one failure with a known,
+    # immediate fix, so name it and give the exact command rather than
+    # leaving it to be dug out of the log.
+    if grep -q "Mirror sync in progress" "$LB_LOG" 2>/dev/null; then
+        _bad=$(grep -oE "Mirror sync in progress\? \[IP: [0-9.]+" "$LB_LOG" \
+               | grep -oE "[0-9.]+$" | sort -u | tr '\n' ' ')
+        echo ""
+        echo "  ══════════════════════════════════════════════════════════"
+        echo "  The build failed because a package mirror is out of sync:"
+        echo "  its index does not match its own files. This is a problem"
+        echo "  with the mirror, not with the build."
+        [[ -n "$_bad" ]] && echo "  Mirror(s) at fault: ${_bad}(currently: ${DEVUAN_MIRROR})"
+        echo ""
+        echo "  Rebuild using a specific mirror instead:"
+        echo ""
+        echo "    DEVUAN_MIRROR=http://ftp.fau.de/devuan/merged $0"
+        echo ""
+        echo "  ══════════════════════════════════════════════════════════"
+    fi
     _die "live-build failed. Check ${LB_LOG}"
 fi
 # Also verify the ISO was actually produced

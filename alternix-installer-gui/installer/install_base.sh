@@ -297,6 +297,23 @@ _install_visor() {
 
     info "Installing Visor boot manager..."
 
+    # USE THE VISOR BUILT INTO THE ISO WHEN IT EXISTS
+    # Hook 0085 builds Visor at ISO build time and keeps it at
+    # /usr/share/alternix/visor. The live system is that image, so it is
+    # already here. Using it skips a clone and a compile on every
+    # install, both of which failed whenever gnu-efi or the network was
+    # unavailable. The build path below remains as a fallback for ISOs
+    # made before that hook existed. The files are laid out exactly as
+    # a fresh build leaves them, so nothing further down changes.
+    local _prebuilt="/usr/share/alternix/visor"
+    if [[ -f "${_prebuilt}/visor_x64.efi" ]]; then
+        info "Using the Visor build included in the ISO."
+        rm -rf /tmp/visor-build
+        mkdir -p /tmp/visor-build/assets/icons /tmp/visor-build/assets/backgrounds
+        cp "${_prebuilt}/visor_x64.efi" /tmp/visor-build/
+        cp "${_prebuilt}/icons/"*.png       /tmp/visor-build/assets/icons/       2>/dev/null || true
+        cp "${_prebuilt}/backgrounds/"*.png /tmp/visor-build/assets/backgrounds/ 2>/dev/null || true
+    else
     # Build deps (gcc/make/git already in the live ISO)
     apt-get install -y gnu-efi efibootmgr 2>>"$ALTERNIX_LOG" || true
 
@@ -309,10 +326,12 @@ _install_visor() {
         return 1
     fi
 
-    if ! (cd /tmp/visor-build && make) 2>&1 | tee -a "$ALTERNIX_LOG"; then
+    # ARCH=x86_64 explicitly; Visor has no 32-bit UEFI target.
+    if ! (cd /tmp/visor-build && make ARCH=x86_64) 2>&1 | tee -a "$ALTERNIX_LOG"; then
         warn "Visor build failed."
         return 1
     fi
+    fi   # end: prebuilt else build
 
     [[ -f /tmp/visor-build/visor_x64.efi ]] || { warn "visor_x64.efi not produced."; return 1; }
 

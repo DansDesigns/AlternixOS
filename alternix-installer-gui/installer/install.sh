@@ -75,6 +75,7 @@ source "${INSTALLER_DIR}/network.sh"
 source "${INSTALLER_DIR}/partition.sh"
 source "${INSTALLER_DIR}/install_base.sh"
 source "${INSTALLER_DIR}/install_copy.sh"
+source "${INSTALLER_DIR}/install_optional.sh"
 source "${INSTALLER_DIR}/configure_system.sh"
 source "${INSTALLER_DIR}/install_desktop.sh"
 
@@ -443,6 +444,10 @@ fi
 # initrd line from what is actually present in /boot, so building the
 # initramfs afterwards leaves a menu entry pointing at the old one.
 # ════════════════════════════════════════════════════════════════
+# Optional components run after the desktop, since some depend on it,
+# and before untune_target_dpkg so they still get the faster unpacking.
+install_optional_components
+
 # Restore dpkg's safe defaults before the system is handed over.
 untune_target_dpkg
 
@@ -485,6 +490,32 @@ echo ""
 cleanup_mounts
 
 rm -f /tmp/.alternix-installer-running
+
+# ════════════════════════════════════════════════════════════════
+# KEEP THE LOGS ON THE INSTALLED SYSTEM — DO NOT REMOVE
+# /tmp is a RAM disk and disappears on reboot. Saving to the USB stick
+# only works when the stick is writable: a virtual machine booting the
+# ISO file sees it as a read-only CD, and a dd-written stick is
+# read-only too, so in both cases there was no log to look at afterwards.
+# The disk just installed to is always writable and still mounted here,
+# so the logs are copied there and can be read after the first boot.
+# The config file is copied without its password line.
+# ════════════════════════════════════════════════════════════════
+if [[ -n "${ALTERNIX_MOUNT:-}" ]] && mountpoint -q "$ALTERNIX_MOUNT" 2>/dev/null; then
+    _logdir="${ALTERNIX_MOUNT}/var/log/alternix-install"
+    if mkdir -p "$_logdir" 2>/dev/null; then
+        for _f in /tmp/alternix-install.log /tmp/alternix-de-target.log \
+                  /tmp/alternix-xorg.log; do
+            [[ -f "$_f" ]] && cp -f "$_f" "$_logdir/" 2>/dev/null
+        done
+        [[ -f /tmp/alternix-install.conf ]] && \
+            grep -v '^ALTERNIX_PASSWORD=' /tmp/alternix-install.conf \
+                > "$_logdir/install.conf" 2>/dev/null
+        chmod 755 "$_logdir"; chmod 644 "$_logdir"/* 2>/dev/null
+        info "Install logs kept on the new system in /var/log/alternix-install/"
+    fi
+    sync
+fi
 
 # UNATTENDED EXIT — DO NOT REMOVE
 # The menu below is an infinite `while true` loop reading stdin. Under
