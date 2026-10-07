@@ -18,14 +18,17 @@ cp -r /mnt/c/Users/dan/github/AlternixOS/alternix-installer-gui ~/alternix-insta
 
 
 cd ~/alternix-installer
-
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# x86_64 Build Command:
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 sudo bash build-iso.sh
 
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# (future upgrade) specific build flags:
-sudo bash build-iso.sh --arm    # ARM64
-sudo bash build-iso.sh --amd    # AMD64 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ARM64 Build Command:
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+sudo bash build-arm.sh
+
 
 
 
@@ -34,7 +37,7 @@ sudo bash build-iso.sh --amd    # AMD64
 
 # 3. Copy it back to windows file system when done (replace "dan/github" with your username & folder location):
 
-cp ~/alternix-installer/alternix-installer.iso /mnt/c/Users/dan/github/AlternixOS/alterniix-installer-gui.iso
+cp ~/alternix-installer/alternix-installer.iso /mnt/c/Users/dan/github/AlternixOS/alternix-installer-gui.iso
 
 (future versions)
 cp ~/alternix-installer/alternix-installer-amd64.iso /mnt/c/Users/dan/github/AlternixOS/

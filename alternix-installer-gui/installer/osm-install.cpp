@@ -103,6 +103,10 @@ struct Answers {
     bool    useHome  = false;
     QString netIface, netSsid;
     bool    netConnected = false;
+    // On-screen keyboard defaults (AlternixDE only), applied by
+    // installer/onboard-defaults.sh.
+    int     onboardPct   = 30;            // keyboard height, % of screen
+    QString onboardTheme = "Nightshade";
 };
 
 static Answers g_ans;
@@ -1596,6 +1600,9 @@ public:
 
         m_note = mkLabel(QString(), 14, FG_DIM);
         body()->addWidget(m_note);
+
+        buildKeyboardSection();
+        body()->addWidget(m_keyboard);
         body()->addStretch(1);
 
         QPushButton *b = mkButton(QStringLiteral("Back"));
@@ -1615,6 +1622,7 @@ public:
     // Re-evaluated on every visit: the desktop choice may have changed.
     void onEnter() override {
         const bool alternix = (g_ans.desktop == QStringLiteral("alternix"));
+        m_keyboard->setVisible(alternix);
         int hidden = 0;
         for (Entry &e : m_entries) {
             const bool show = alternix || !e.alternixOnly;
@@ -1628,6 +1636,74 @@ public:
     }
 
 private:
+    // ON-SCREEN KEYBOARD
+    // Onboard's starting size and theme on the installed system. It is
+    // docked to the bottom edge of the screen at this height. Shown only
+    // for the Alternix desktop, which is the one that uses onboard.
+    // The values go to install.sh as ALTERNIX_ONBOARD_PCT and
+    // ALTERNIX_ONBOARD_THEME; see installer/onboard-defaults.sh for why
+    // onboard used to open filling half the screen.
+    void buildKeyboardSection() {
+        m_keyboard = new QWidget;
+        QVBoxLayout *v = new QVBoxLayout(m_keyboard);
+        v->setContentsMargins(0, 12, 0, 0);
+        v->setSpacing(10);
+        v->addWidget(mkLabel(QStringLiteral("On-screen keyboard"), 19, FG, true));
+        v->addWidget(mkLabel(QStringLiteral(
+            "Pinned to the bottom of the screen. Choose how much of the "
+            "screen it covers when it opens. It can be changed later in "
+            "its own settings."), 15, FG_DIM));
+
+        // Size: three large tap targets rather than a slider, which is
+        // awkward to hit accurately on a small touch screen.
+        struct Size { const char *name; int pct; };
+        static const Size sizes[] = {
+            {"Small", 22}, {"Medium", 30}, {"Large", 38}
+        };
+        QHBoxLayout *row = new QHBoxLayout;
+        row->setSpacing(12);
+        for (const Size &sz : sizes) {
+            ClickableCard *card = new ClickableCard;
+            QVBoxLayout *cv = new QVBoxLayout(card);
+            cv->setContentsMargins(14, 12, 14, 12);
+            cv->setSpacing(2);
+            cv->addWidget(mkLabel(QString::fromUtf8(sz.name), 17, FG, true));
+            cv->addWidget(mkLabel(QString("%1% of the screen").arg(sz.pct), 14, FG_DIM));
+            const int pct = sz.pct;
+            card->setOnClick([this, card, pct]() {
+                for (ClickableCard *c : m_sizeCards) c->setSelected(c == card);
+                g_ans.onboardPct = pct;
+            });
+            if (pct == g_ans.onboardPct) card->setSelected(true);
+            m_sizeCards.append(card);
+            row->addWidget(card, 1);
+        }
+        v->addLayout(row);
+
+        // Theme: the themes shipped in onboard-common (1.4.1). The
+        // installer checks the file exists in the target and falls back
+        // to onboard's own default if it does not.
+        v->addWidget(mkLabel(QStringLiteral("Theme"), 15, FG_DIM));
+        QComboBox *theme = new QComboBox;
+        theme->setMinimumHeight(50);
+        theme->setStyleSheet(QString(
+            "QComboBox { background: #1e1e1e; color: %1; border: 1px solid #4a4a4a;"
+            "  border-radius: 6px; padding: 0 12px; font-size: 17px; }"
+            "QComboBox QAbstractItemView { background: #1e1e1e; color: %1;"
+            "  selection-background-color: %2; font-size: 17px; }")
+            .arg(FG, ACCENT));
+        theme->addItems({
+            "Nightshade", "Blackboard", "DarkRoom", "Droid", "Ambiance",
+            "Classic Onboard", "ModelM", "Typist", "LowContrast",
+            "HighContrast", "HighContrastInverse"
+        });
+        theme->setCurrentText(g_ans.onboardTheme);
+        QObject::connect(theme, &QComboBox::currentTextChanged, m_keyboard,
+                         [](const QString &t) { g_ans.onboardTheme = t; });
+        v->addWidget(theme);
+
+    }
+
     struct Entry {
         ClickableCard *card;
         QLabel        *tick;
@@ -1654,8 +1730,10 @@ private:
             .arg(on ? ACCENT : "#5a5a5a", on ? ACCENT : "transparent"));
     }
 
-    QList<Entry> m_entries;
-    QLabel      *m_note = nullptr;
+    QList<Entry>           m_entries;
+    QLabel                *m_note = nullptr;
+    QList<ClickableCard *> m_sizeCards;
+    QWidget               *m_keyboard = nullptr;
 };
 
 // Display name for an optional component id, for the summary page.
@@ -1724,6 +1802,10 @@ public:
         addRow(QStringLiteral("Timezone"),  g_ans.timezone);
         addRow(QStringLiteral("Language"),  g_ans.locale);
         addRow(QStringLiteral("Desktop"),   g_ans.desktop);
+        if (g_ans.desktop == QStringLiteral("alternix"))
+            addRow(QStringLiteral("Keyboard"),
+                   QString("%1% height, %2").arg(g_ans.onboardPct)
+                                            .arg(g_ans.onboardTheme));
         QStringList optNames;
         for (const QString &id : g_ans.optional) optNames << optionalName(id);
         addRow(QStringLiteral("Optional"),
@@ -2264,6 +2346,17 @@ static bool writeConf(QString *errOut) {
     QStringList generic = g_ans.optional;
     generic.removeAll(QStringLiteral("telephony"));
     ts << "ALTERNIX_OPTIONAL=" << shQuote(generic.join(' ')) << "\n";
+
+    // On-screen keyboard defaults. The screen size is this device's
+    // panel in real pixels, which the installed system will also use,
+    // so onboard can be sized to fit it exactly.
+    ts << "ALTERNIX_ONBOARD_PCT="   << g_ans.onboardPct << "\n";
+    ts << "ALTERNIX_ONBOARD_THEME=" << shQuote(g_ans.onboardTheme) << "\n";
+    if (QScreen *scr = QApplication::primaryScreen()) {
+        const QSize px = scr->geometry().size() * scr->devicePixelRatio();
+        ts << "ALTERNIX_SCREEN_W=" << px.width()  << "\n";
+        ts << "ALTERNIX_SCREEN_H=" << px.height() << "\n";
+    }
     ts << "TARGET_DISK="       << shQuote(g_ans.targetDisk) << "\n";
     ts << "PART_MODE='guided'\n";
     ts << "USE_SWAP=" << (g_ans.useSwap ? 1 : 0) << "\n";

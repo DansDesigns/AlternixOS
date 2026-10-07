@@ -431,6 +431,16 @@ else
     install_desktop
 fi
 
+# On-screen keyboard defaults, for both the baked and the built
+# desktop. Without these onboard opens tiled by Qtile and fills half
+# the screen; see installer/onboard-defaults.sh.
+if [[ "${ALTERNIX_DESKTOP:-}" == "alternix" ]]; then
+    bash "${INSTALLER_DIR}/onboard-defaults.sh" "$ALTERNIX_MOUNT" \
+        "${ALTERNIX_ONBOARD_PCT:-30}" "${ALTERNIX_ONBOARD_THEME:-Nightshade}" \
+        "${ALTERNIX_SCREEN_W:-}" "${ALTERNIX_SCREEN_H:-}" \
+        || warn "Could not set the on-screen keyboard defaults; onboard will use its own."
+fi
+
 # ════════════════════════════════════════════════════════════════
 # STAGE 9c: Bootloader + initramfs (copy install only)
 #

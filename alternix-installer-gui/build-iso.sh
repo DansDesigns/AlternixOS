@@ -623,11 +623,26 @@ export TERM=xterm
 
 echo "  · Building AlternixDE (this takes a while; output -> ${BUILD_LOG})"
 
+# BUILD WRAPPERS — see /installer/de-shims.sh. Without them the
+# auto-cpufreq installer gets "2" from this stream instead of "i" and
+# aborts, and its daemon start then fails because OpenRC is not running
+# inside this chroot. Either one ends the desktop build under set -e.
+if [ -f /installer/de-shims.sh ]; then
+    bash /installer/de-shims.sh add / >>"$BUILD_LOG" 2>&1
+    export PATH="/usr/local/lib/alternix-de-shims:${PATH}"
+else
+    echo "  ! /installer/de-shims.sh missing; auto-cpufreq will likely fail."
+fi
+
 set +e
 { echo "root"; yes 2; } | \
     timeout 7200 bash install-alternix_devuan.sh >>"$BUILD_LOG" 2>&1
 DE_RC=$?
 set -e
+
+# Remove them before anything else, so neither wrapper ends up in the
+# image that every installed system is copied from.
+[ -f /installer/de-shims.sh ] && bash /installer/de-shims.sh remove /
 
 if [ "$DE_RC" -ne 0 ]; then
     if [ "$DE_RC" -eq 124 ]; then

@@ -287,27 +287,22 @@ KBEOF
     #
     #   line   34  username                 -> the real username
     #   line  176  telephony [1/2]          -> the user's choice
-    #   line 1181  ./auto-cpufreq-installer -> "i" for install
-    #
-    # On that third one, the upstream installer prompts
-    #   "Select a key [I]nstall/[R]emove or press ctrl+c to quit:"
-    # and its dispatch is:
-    #   case $answer in I|i) ...;; R|r) ...;;
-    #     *) echo "Unknown key, aborting ..."; exit 1 ;;
-    # so any other answer makes it exit 1, which `set -e` in the
-    # AlternixDE script turns into the whole desktop build dying.
-    # Feeding "i" here is a workaround. The proper fix is upstream in
-    # install-alternix_devuan.sh: that installer accepts --install as
-    # an argument and then never reads stdin at all.
+    #   line 1181  ./auto-cpufreq-installer -> NOT answered from here
     #   line 1211  restart or continue      -> ALWAYS "2"
+    #
+    # auto-cpufreq used to be answered with an "i" in this stream, but a
+    # fixed-order stream cannot work for it: any command between the
+    # telephony prompt and line 1181 that reads stdin takes the "i", the
+    # installer then gets "2", prints "Unknown key, aborting" and exits
+    # 1, ending the build. de-shims.sh now adds --install to that call
+    # instead, which skips the prompt. See de-shims.sh for the details.
     #
     # That last one must never be answered "1". Option 1 runs
     # `sudo reboot` immediately, which would restart the machine in the
     # middle of the install, before the bootloader has been written.
     #
     # `yes 2` on the end keeps the stream alive so there is never a
-    # second EOF, and harmlessly re-answers the final prompt if
-    # auto-cpufreq consumed fewer lines than expected.
+    # second EOF.
     # ═══════════════════════════════════════════════════════════
     local _tele="${ALTERNIX_TELEPHONY:-2}"
     local alt_exit=0
@@ -364,8 +359,22 @@ KBEOF
     chroot "$ALTERNIX_MOUNT" /bin/bash -c \
         "sed -i 's/\r$//' /home/${ALTERNIX_USERNAME}/Alternix/install-alternix_devuan.sh" \
         >> "$_alt_de_log" 2>&1 || true
+
+    # BUILD WRAPPERS — needed by BOTH the graphical and text installer.
+    # The service-start failure happens in any chroot, not only when
+    # unattended. See de-shims.sh for what each wrapper fixes. PATH is
+    # set explicitly so the sudo wrapper is found first.
+    local _de_path="/usr/local/lib/alternix-de-shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [[ -f "${INSTALLER_DIR}/de-shims.sh" ]]; then
+        bash "${INSTALLER_DIR}/de-shims.sh" add "$ALTERNIX_MOUNT" \
+            >> "$_alt_de_log" 2>&1 || warn "Could not install the desktop build wrappers."
+    else
+        warn "de-shims.sh missing — auto-cpufreq will likely fail to install."
+    fi
+
     if [[ "${ALTERNIX_UNATTENDED:-0}" -eq 1 ]]; then
         chroot "$ALTERNIX_MOUNT" /usr/bin/env \
+            PATH="$_de_path" \
             DEBIAN_FRONTEND=noninteractive \
             DEBCONF_NONINTERACTIVE_SEEN=true \
             TARGET_USER="${ALTERNIX_USERNAME}" \
@@ -374,7 +383,7 @@ KBEOF
             /bin/bash -c \
             "cd /home/${ALTERNIX_USERNAME}/Alternix && \
              bash install-alternix_devuan.sh" \
-            < <({ echo "${ALTERNIX_USERNAME}"; echo "${_tele}"; echo "i"; yes 2; }) \
+            < <({ echo "${ALTERNIX_USERNAME}"; echo "${_tele}"; yes 2; }) \
             2>&1 | tee -a "$_alt_de_log"
         # PIPESTATUS, not $? — $? here is tee's exit code, which is
         # always 0 and would report every failed build as a success.
@@ -383,6 +392,7 @@ KBEOF
         # Run interactively — direct terminal, no pipes, so prompts work.
         # DEBIAN_FRONTEND=noninteractive stops debconf TUIs opening.
         chroot "$ALTERNIX_MOUNT" /usr/bin/env \
+            PATH="$_de_path" \
             DEBIAN_FRONTEND=noninteractive \
             DEBCONF_NONINTERACTIVE_SEEN=true \
             HOME="/home/${ALTERNIX_USERNAME}" \
@@ -391,6 +401,11 @@ KBEOF
              bash install-alternix_devuan.sh"
         alt_exit=$?
     fi
+
+    # Take the wrappers out again, whether the build worked or not, so
+    # the installed system keeps the real sudo and rc-service only.
+    [[ -f "${INSTALLER_DIR}/de-shims.sh" ]] && \
+        bash "${INSTALLER_DIR}/de-shims.sh" remove "$ALTERNIX_MOUNT" 2>/dev/null
 
     # ═══════════════════════════════════════════════════════════
     # HOME OWNERSHIP FIX — DO NOT REMOVE
