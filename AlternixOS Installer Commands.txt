@@ -4,9 +4,8 @@
 # to change the location of NexOS folder, change the line:
 # cp -r /mnt/[DRIVE]/[FOLDER-PATH]/NexOS/nexos-installer
 
-# 1. Type the following lines into Debian WSL2:
+# 1. Type the following lines into Debian WSL2 (or select all and copy/paste):
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 
 cd ~
 
@@ -16,37 +15,37 @@ sudo rm -rf ~/alternix-installer
 # copy installer folder from Windows file system to Debian WSL2 (replace "Users/dan/github" with your username & folder location):
 cp -r /mnt/c/Users/dan/github/AlternixOS/alternix-installer-gui ~/alternix-installer
 
+# sometimes .efi file isn't copied, if so uncomment:
+#cp -r /mnt/c/Users/dan/GitHub/AlternixOS/alternix-installer-gui/efi ~/alternix-installer/efi
+
 
 cd ~/alternix-installer
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # x86_64 Build Command:
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 sudo bash build-iso.sh
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ARM64 Build Command:
+# install these first:
+
+sudo apt install qemu-user-static binfmt-support debootstrap dosfstools fdisk xz-utils
+
+sudo bash build-arm.sh
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 sudo bash build-arm.sh
 
 
 
-
-# 2. ISO appears in ~/alternix-installer/
-
-
-# 3. Copy it back to windows file system when done (replace "dan/github" with your username & folder location):
+# 2. ISO appears in ~/alternix-installer
+# Copy it back to windows file system when done (replace "dan/github" with your username & folder location):
 
 cp ~/alternix-installer/alternix-installer.iso /mnt/c/Users/dan/github/AlternixOS/alternix-installer-gui.iso
 
-(future versions)
-cp ~/alternix-installer/alternix-installer-amd64.iso /mnt/c/Users/dan/github/AlternixOS/
-cp ~/alternix-installer/alternix-installer-arm64.iso /mnt/c/Users/dan/github/AlternixOS/
 
 
-ERROR NOTE:
-When you drop to shell after Ctrl+C, the commands to know are:
-
-cat /tmp/nexos-install.log | tail -50 — main installer log
-cat /tmp/sel4-build.log | tail -50 — seL4 build detail
-bash /installer/install.sh — restart installer manually
+# 32bit uefi file:
+cp -r /mnt/c/Users/dan/GitHub/AlternixOS/alternix-installer-gui/efi ~/alternix-installer/efi
