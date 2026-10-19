@@ -921,7 +921,23 @@ public:
 
         m_psk = mkEdit(QStringLiteral("WiFi password (blank if open)"), true);
         m_pskRow = mkPasswordRow(m_psk);
+        // Offer a one-tap recovery if a touchscreen Backspace fails or
+        // the user wants to enter a different network password.
+        auto *clearPsk = new QPushButton(QStringLiteral("Clear"), m_pskRow);
+        clearPsk->setFocusPolicy(Qt::NoFocus);
+        clearPsk->setMinimumHeight(50);
+        clearPsk->setMinimumWidth(72);
+        clearPsk->setStyleSheet(QStringLiteral(
+            "QPushButton { background: #3a3a3a; color: #e8e8e8;"
+            " border: none; border-radius: 6px; font-size: 15px; }"));
+        m_pskRow->layout()->addWidget(clearPsk);
+        QObject::connect(clearPsk, &QPushButton::clicked, m_psk, [this]() {
+            m_psk->clear();
+            m_psk->setFocus();
+        });
         body()->addWidget(m_pskRow);
+        QObject::connect(m_ssidList, &QListWidget::currentRowChanged,
+                         m_psk, [this](int) { m_psk->clear(); });
 
         m_connectBtn = mkButton(QStringLiteral("Connect"), true);
         body()->addWidget(m_connectBtn);
@@ -942,7 +958,7 @@ public:
                          [this]() { doConnect(); });
         QObject::connect(m_ifaceBox,
                          QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-                         [this](int) { updateWifiControls(); });
+                         [this](int) { m_psk->clear(); updateWifiControls(); });
     }
 
     // DRIVER PRELOAD — started from main(), not from onEnter().
@@ -959,6 +975,9 @@ public:
     }
 
     void onEnter() override {
+        // Never retain a Wi-Fi password when revisiting this wizard page.
+        // The QLineEdit persists with the page, so explicitly reset it.
+        m_psk->clear();
         if (m_populated) return;
         m_populated = true;
 
@@ -1013,6 +1032,10 @@ private:
         updateWifiControls();
     }
 
+public:
+    void clearPassword() { if (m_psk) m_psk->clear(); }
+
+private:
     bool currentIsWifi() const {
         if (m_ifaceBox->currentIndex() < 0) return false;
         return m_ifaceBox->currentData().toStringList().value(1) == "wifi";
@@ -2456,6 +2479,9 @@ protected:
 private:
     void navigate(Page *page) {
         if (!page) return;
+        if (m_network && m_stack->currentWidget() == m_network &&
+            page != m_network)
+            m_network->clearPassword();
         m_stack->setCurrentWidget(page);
         page->onEnter();
     }

@@ -166,7 +166,7 @@ EOF
     # Core packages
     local pkgs=(
         "openrc" "sysvinit-utils" "elogind" "libpam-elogind"
-        "grub-pc" "grub-efi-amd64" "os-prober"
+        "grub-pc" "grub-efi-amd64" "grub-efi-ia32-bin" "os-prober"
         "bash" "coreutils" "util-linux" "procps" "psmisc"
         "findutils" "grep" "sed" "gawk"
         "iproute2" "iputils-ping" "wget" "curl"
@@ -181,6 +181,7 @@ EOF
     if [[ "$HW_ARCH" == "aarch64" ]]; then
         pkgs=("${pkgs[@]/grub-pc/}")
         pkgs=("${pkgs[@]/grub-efi-amd64/grub-efi-arm64}")
+        pkgs=("${pkgs[@]/grub-efi-ia32-bin/}")
     fi
 
     local apt_ok=0
@@ -294,6 +295,9 @@ _setup_openrc() {
 _install_visor() {
     local esp="${ALTERNIX_MOUNT}/boot/efi"
     local root_uuid="$1"
+    local root_delay=""
+    [[ "${TARGET_DISK:-}" == /dev/mmcblk* ]] && root_delay=" rootdelay=5"
+    [[ -n "$root_uuid" ]] || { warn "Missing root filesystem UUID for Visor."; return 1; }
 
     info "Installing Visor boot manager..."
 
@@ -364,8 +368,10 @@ _install_visor() {
     kernel=$(ls "${ALTERNIX_MOUNT}/boot/vmlinuz-"* 2>/dev/null | sort | sed -n '$p')
     initrd=$(ls "${ALTERNIX_MOUNT}/boot/initrd.img-"* 2>/dev/null | sort | sed -n '$p')
     [[ -z "$kernel" || -z "$initrd" ]] && { warn "Kernel/initrd missing for Visor."; return 1; }
-    cp "$kernel" "${esp}/EFI/alternix/vmlinuz"
-    cp "$initrd" "${esp}/EFI/alternix/initrd.img"
+    cp "$kernel" "${esp}/EFI/alternix/vmlinuz" || { warn "Failed copying kernel to ESP"; return 1; }
+    cp "$initrd" "${esp}/EFI/alternix/initrd.img" || { warn "Failed copying initrd to ESP"; return 1; }
+    [[ -s "${esp}/EFI/alternix/vmlinuz" && -s "${esp}/EFI/alternix/initrd.img" ]] || \
+        { warn "Visor kernel/initrd missing on ESP"; return 1; }
 
     # Write boot.conf
     cat > "${esp}/EFI/visor/boot.conf" << VISOREOF
@@ -380,7 +386,7 @@ linux {
     icon    = \\EFI\\visor\\icons\\linux.png
     kernel  = \\EFI\\alternix\\vmlinuz
     initrd  = \\EFI\\alternix\\initrd.img
-    cmdline = "root=UUID=${root_uuid} ro quiet"
+    cmdline = "root=UUID=${root_uuid} ro quiet${root_delay}"
 }
 
 linux {
@@ -389,7 +395,7 @@ linux {
     icon    = \\EFI\\visor\\icons\\linux.png
     kernel  = \\EFI\\alternix\\vmlinuz
     initrd  = \\EFI\\alternix\\initrd.img
-    cmdline = "root=UUID=${root_uuid} ro single"
+    cmdline = "root=UUID=${root_uuid} ro single${root_delay}"
 }
 VISOREOF
 
@@ -451,7 +457,7 @@ _install_bootloader() {
     section "Bootloader"
 
     # Re-detect EFI properly
-    if [[ -d /sys/firmware/efi/efivars ]] && ls /sys/firmware/efi/efivars/ &>/dev/null 2>&1; then
+    if [[ -d /sys/firmware/efi ]]; then
         USE_EFI=1
         info "EFI system detected."
     else
@@ -459,14 +465,26 @@ _install_bootloader() {
         info "BIOS/Legacy system detected."
     fi
 
+    # 32-bit UEFI firmware can run an amd64 CPU/kernel, but cannot execute
+    # the 64-bit Visor EFI executable. Linux publishes the firmware bitness
+    # here (it is not the same thing as `uname -m`).
+    local efi_bits=64 efi_target=x86_64-efi
+    if [[ $USE_EFI -eq 1 && -r /sys/firmware/efi/fw_platform_size ]]; then
+        read -r efi_bits < /sys/firmware/efi/fw_platform_size
+    fi
+    if [[ $USE_EFI -eq 1 && "$efi_bits" == 32 ]]; then
+        efi_target=i386-efi
+    fi
+
     info "Target disk: ${TARGET_DISK}"
     info "Boot mode:   $([ $USE_EFI -eq 1 ] && echo EFI || echo BIOS)"
+    [[ $USE_EFI -eq 1 ]] && info "UEFI firmware: ${efi_bits}-bit (${efi_target})"
     echo ""
 
     # Ensure grub-install is available
     if ! command -v grub-install &>/dev/null; then
         warn "grub-install not found — installing..."
-        apt-get install -y grub2-common grub-pc-bin grub-efi-amd64-bin 2>>"$ALTERNIX_LOG" || true
+        apt-get install -y grub2-common grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin 2>>"$ALTERNIX_LOG" || true
     fi
 
     if ! command -v grub-install &>/dev/null; then
@@ -478,9 +496,13 @@ _install_bootloader() {
     echo ""
 
     # Install grub
-    # UEFI: Visor is the primary boot manager; GRUB-EFI is the fallback
+    # 64-bit UEFI: Visor is primary. 32-bit UEFI: GRUB i386-efi is
+    # mandatory, since Visor cannot execute on that firmware.
     local visor_ok=0
-    if [[ $USE_EFI -eq 1 ]]; then
+    if [[ $USE_EFI -eq 1 && "$efi_target" == i386-efi ]]; then
+        info "32-bit UEFI detected: using GRUB text menu; skipping x64-only Visor."
+    fi
+    if [[ $USE_EFI -eq 1 && "$efi_target" == x86_64-efi ]]; then
         local _root_uuid
         _root_uuid=$(blkid -s UUID -o value "${PART_ROOT}")
         if _install_visor "$_root_uuid"; then
@@ -492,24 +514,48 @@ _install_bootloader() {
     fi
 
     if [[ $USE_EFI -eq 1 && $visor_ok -eq 0 ]]; then
-        info "Running grub-install (EFI)..."
-        grub-install             --target=x86_64-efi             --efi-directory="${ALTERNIX_MOUNT}/boot/efi"             --boot-directory="${ALTERNIX_MOUNT}/boot"             --bootloader-id=Alternix             --recheck             --no-floppy             2>&1 | tee -a "$ALTERNIX_LOG"
+        info "Running grub-install (${efi_target})..."
+        grub-install \
+            --target="$efi_target" \
+            --efi-directory="${ALTERNIX_MOUNT}/boot/efi" \
+            --boot-directory="${ALTERNIX_MOUNT}/boot" \
+            --bootloader-id=Alternix \
+            --recheck --no-floppy 2>&1 | tee -a "$ALTERNIX_LOG"
         local exit1=${PIPESTATUS[0]}
         if [[ $exit1 -ne 0 ]]; then
+            if [[ "$efi_target" == i386-efi ]]; then
+                err "32-bit UEFI GRUB install failed (${exit1})."
+                err "Cannot use BIOS/64-bit Visor fallback on 32-bit UEFI firmware."
+                return 1
+            fi
             warn "EFI grub-install failed (${exit1}) — trying BIOS fallback."
             USE_EFI=0
         else
             ok "GRUB (EFI) installed."
-            # Also install BIOS fallback MBR so machine boots even without EFI NVRAM entry
-            info "Installing BIOS fallback MBR..."
-            grub-install                 --target=i386-pc                 --boot-directory="${ALTERNIX_MOUNT}/boot"                 --recheck                 --no-floppy                 "${TARGET_DISK}"                 2>&1 | tee -a "$ALTERNIX_LOG" || true
-            # Copy EFI bootloader to fallback path so UEFI finds it automatically
+            # BIOS fallback only makes sense on systems with BIOS boot
+            # support; do not alter the MBR of a 32-bit UEFI-only tablet.
+            if [[ "$efi_target" != i386-efi ]]; then
+                info "Installing BIOS fallback MBR..."
+                grub-install --target=i386-pc \
+                    --boot-directory="${ALTERNIX_MOUNT}/boot" \
+                    --recheck --no-floppy "${TARGET_DISK}" \
+                    2>&1 | tee -a "$ALTERNIX_LOG" || true
+            fi
+            # Copy the architecture-matching loader to the standard EFI
+            # removable-media path. BOOTX64.EFI will not run on IA32 UEFI.
             local efi_boot="${ALTERNIX_MOUNT}/boot/efi/EFI/BOOT"
             local efi_alternix="${ALTERNIX_MOUNT}/boot/efi/EFI/Alternix"
+            local grub_name=grubx64.efi boot_name=BOOTX64.EFI
+            if [[ "$efi_target" == i386-efi ]]; then
+                grub_name=grubia32.efi
+                boot_name=BOOTIA32.EFI
+            fi
             mkdir -p "$efi_boot"
-            if [[ -f "${efi_alternix}/grubx64.efi" ]]; then
-                cp "${efi_alternix}/grubx64.efi" "${efi_boot}/BOOTX64.EFI"
-                ok "EFI fallback bootloader copied to EFI/BOOT/BOOTX64.EFI"
+            if [[ -f "${efi_alternix}/${grub_name}" ]]; then
+                cp "${efi_alternix}/${grub_name}" "${efi_boot}/${boot_name}"
+                ok "EFI fallback bootloader copied to EFI/BOOT/${boot_name}"
+            else
+                warn "Cannot find ${efi_alternix}/${grub_name} for the fallback loader."
             fi
         fi
     fi
@@ -552,7 +598,8 @@ _install_bootloader() {
     # partition and writes wrong kernel paths. We ALWAYS overwrite
     # grub.cfg with a known-good config here.
     # ═══════════════════════════════════════════════════════════
-    local kernel initrd root_uuid boot_uuid kernel_prefix
+    local kernel initrd root_uuid boot_uuid kernel_prefix root_delay=""
+    [[ "${TARGET_DISK:-}" == /dev/mmcblk* ]] && root_delay=" rootdelay=5"
     kernel=$(ls "${ALTERNIX_MOUNT}/boot/vmlinuz-"* 2>/dev/null | sort | sed -n '$p' | xargs basename 2>/dev/null)
     initrd=$(ls "${ALTERNIX_MOUNT}/boot/initrd.img-"* 2>/dev/null | sort | sed -n '$p' | xargs basename 2>/dev/null)
 
@@ -564,6 +611,9 @@ _install_bootloader() {
     fi
 
     root_uuid=$(blkid -s UUID -o value "${PART_ROOT}")
+    [[ -n "$root_uuid" ]] || die "Cannot determine installed root UUID."
+    [[ -n "$initrd" && -s "${ALTERNIX_MOUNT}/boot/$initrd" ]] || \
+        die "No usable initramfs for GRUB in /boot"
 
     # Separate /boot partition: kernel lives at partition root, no /boot prefix
     if [[ -n "${PART_BOOT:-}" ]]; then
@@ -603,13 +653,13 @@ fi
 
 menuentry "Alternix" {
     search --no-floppy --fs-uuid --set=root ${boot_uuid}
-    linux ${kernel_prefix}/${kernel} root=UUID=${root_uuid} ro quiet
+    linux ${kernel_prefix}/${kernel} root=UUID=${root_uuid} ro quiet${root_delay}
     initrd ${kernel_prefix}/${initrd}
 }
 
 menuentry "Alternix (recovery)" {
     search --no-floppy --fs-uuid --set=root ${boot_uuid}
-    linux ${kernel_prefix}/${kernel} root=UUID=${root_uuid} ro single
+    linux ${kernel_prefix}/${kernel} root=UUID=${root_uuid} ro single${root_delay}
     initrd ${kernel_prefix}/${initrd}
 }
 GRUBEOF

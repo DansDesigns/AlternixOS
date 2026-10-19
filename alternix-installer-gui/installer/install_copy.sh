@@ -194,7 +194,17 @@ EOF
     _copy_chroot "DEBIAN_FRONTEND=noninteractive apt-get purge -y \
         live-boot live-boot-initramfs-tools live-config \
         live-config-sysvinit live-tools live-boot-doc live-config-doc" \
-        >>"$ALTERNIX_LOG" 2>&1 || warn "Some live packages were not present."
+        >>"$ALTERNIX_LOG" 2>&1 || warn "Live package purge returned a nonzero status; checking it below."
+
+    # A leftover live-boot initramfs hook makes the copied installation
+    # search for a squashfs instead of mounting its root UUID.
+    local live_pkg
+    for live_pkg in live-boot live-boot-initramfs-tools; do
+        if chroot "$ALTERNIX_MOUNT" dpkg-query -W -f='${Status}' "$live_pkg" 2>/dev/null | \
+            grep -qx 'install ok installed'; then
+            die "$live_pkg remains installed in target; cannot build a normal disk initramfs."
+        fi
+    done
 
     _copy_chroot "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y" \
         >>"$ALTERNIX_LOG" 2>&1 || true
@@ -206,6 +216,26 @@ EOF
           "${ALTERNIX_MOUNT}/usr/share/initramfs-tools/scripts/live-premount"/* \
           2>/dev/null || true
     rm -rf "${ALTERNIX_MOUNT}/lib/live" 2>/dev/null || true
+
+    # ── Remove live-installer-only power-management restrictions ──
+    # The ISO masks sleep targets and disables elogind suspension so that
+    # an unattended installer cannot suspend halfway through disk writes.
+    # The fast install copies the live squashfs, so discard ONLY our own
+    # installer-specific masks/configuration from the installed OS.
+    # Do not undo masks that another package/admin may have installed.
+    info "Removing live-installer sleep restrictions from target..."
+    local sleep_unit mask
+    for sleep_unit in sleep.target suspend.target hibernate.target \
+                      hybrid-sleep.target suspend-then-hibernate.target; do
+        mask="${ALTERNIX_MOUNT}/etc/systemd/system/${sleep_unit}"
+        if [[ -L "$mask" && "$(readlink "$mask")" == /dev/null ]]; then
+            rm -f -- "$mask"
+        fi
+    done
+    rm -f -- \
+        "${ALTERNIX_MOUNT}/etc/elogind/sleep.conf.d/90-alternix-installer-awake.conf" \
+        "${ALTERNIX_MOUNT}/etc/elogind/logind.conf.d/90-alternix-installer-awake.conf" \
+        "${ALTERNIX_MOUNT}/etc/systemd/sleep.conf.d/90-alternix-installer-awake.conf"
 
     # ── Remove the installer itself ───────────────────────────────
     info "Removing installer..."
@@ -279,7 +309,7 @@ finalise_copy() {
     # root device and the resume device from fstab; building it any
     # earlier bakes in the live system's idea of where root lives.
     if [[ ! -s "${ALTERNIX_MOUNT}/etc/fstab" ]]; then
-        err "/etc/fstab is empty — the target will not boot. Check _configure_fstab ran."
+        die "/etc/fstab is empty — the target will not boot. Check _configure_fstab ran."
     fi
 
     local fs
@@ -289,6 +319,29 @@ finalise_copy() {
             mount --bind "/${fs}" "${ALTERNIX_MOUNT}/${fs}" 2>/dev/null || true
     done
 
+    # Tablet-safe early userspace: include general storage modules and
+    # common eMMC host drivers. Module existence is checked in the target
+    # kernel tree to avoid warnings on kernels without a given driver.
+    if [[ "${TARGET_DISK:-}" == /dev/mmcblk* ]]; then
+        mkdir -p "${ALTERNIX_MOUNT}/etc/initramfs-tools"
+        local initconf="${ALTERNIX_MOUNT}/etc/initramfs-tools/initramfs.conf"
+        if [[ -f "$initconf" ]]; then
+            if grep -q '^MODULES=' "$initconf"; then
+                sed -i 's/^MODULES=.*/MODULES=most/' "$initconf"
+            else
+                echo 'MODULES=most' >> "$initconf"
+            fi
+        fi
+        local module
+        for module in mmc_block mmc_core sdhci sdhci_acpi sdhci_pci sdhci_pltfm; do
+            if find "${ALTERNIX_MOUNT}/lib/modules" -type f \
+                \( -name "${module}.ko" -o -name "${module}.ko.*" -o -name "${module//_/-}.ko*" \) \
+                -print -quit 2>/dev/null | grep -q .; then
+                grep -qx "$module" "${ALTERNIX_MOUNT}/etc/initramfs-tools/modules" 2>/dev/null || \
+                    echo "$module" >> "${ALTERNIX_MOUNT}/etc/initramfs-tools/modules"
+            fi
+        done
+    fi
     info "Rebuilding initramfs..."
     if ! chroot "$ALTERNIX_MOUNT" /bin/bash -c \
             "update-initramfs -u -k all" >>"$ALTERNIX_LOG" 2>&1; then
@@ -296,19 +349,28 @@ finalise_copy() {
         # when the image was built without an initramfs for this kernel.
         chroot "$ALTERNIX_MOUNT" /bin/bash -c \
             "update-initramfs -c -k all" >>"$ALTERNIX_LOG" 2>&1 || \
-            err "update-initramfs failed — the installed system may not boot."
+            die "update-initramfs failed; installation is not bootable."
     fi
 
     # Verify something was actually produced.
     if ! ls "${ALTERNIX_MOUNT}"/boot/initrd.img-* >/dev/null 2>&1; then
-        err "No initramfs in /boot after update-initramfs. The target will not boot."
+        die "No initramfs in /boot after update-initramfs. The target will not boot."
     fi
 
     for fs in dev/pts dev sys proc; do
         umount "${ALTERNIX_MOUNT}/${fs}" 2>/dev/null || true
     done
 
-    ok "Initramfs rebuilt."
+    # Make sure the actual kernel has a matching initramfs. An old
+    # unrelated initrd alone must not count as a successful build.
+    local kfile kversion
+    for kfile in "${ALTERNIX_MOUNT}"/boot/vmlinuz-*; do
+        [[ -f "$kfile" ]] || continue
+        kversion="${kfile##*/vmlinuz-}"
+        [[ -s "${ALTERNIX_MOUNT}/boot/initrd.img-${kversion}" ]] || \
+            die "Kernel $kversion is missing its matching initramfs."
+    done
+    ok "Initramfs rebuilt and matched to installed kernels."
 }
 
 # ── dpkg tuning for the target ────────────────────────────────────

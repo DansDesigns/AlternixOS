@@ -22,6 +22,7 @@
 #include <QKeyEvent>
 #include <QHideEvent>
 #include <QLineEdit>
+#include <QPointer>
 #include <QShowEvent>
 #include <QPushButton>
 #include <QString>
@@ -77,6 +78,11 @@ public:
         hide();
         QObject::connect(qApp, &QApplication::focusChanged, this,
                          [this](QWidget *, QWidget *now) {
+                             // Preserve the last genuine input target across
+                             // touch button focus changes. A keyboard tap must
+                             // never switch the destination to a button.
+                             if (auto *edit = qobject_cast<QLineEdit *>(now))
+                                 m_lastLineEdit = edit;
                              if (!m_autoShow) return;
                              // Ignore focus landing on our own buttons.
                              if (now && isAncestorOf(now)) return;
@@ -122,6 +128,31 @@ private:
     // ── Send a synthetic key event to whatever currently has focus ──
     void emitKey(int qtKey, const QString &text) {
         QWidget *target = QApplication::focusWidget();
+        QLineEdit *edit = qobject_cast<QLineEdit *>(target);
+        // Some tablet touch drivers clear focus when a keyboard key is
+        // tapped. Deliver edits to the last *visible* line edit instead
+        // of losing Backspace (or inserting into the wrong widget).
+        if (!edit && m_lastLineEdit && m_lastLineEdit->isVisible() &&
+            m_lastLineEdit->isEnabled())
+            edit = m_lastLineEdit.data();
+
+        if (edit && !edit->isReadOnly() && edit->isVisible()) {
+            if (qtKey == Qt::Key_Backspace) {
+                // A tap in the password field can leave the cursor at the
+                // beginning. If there is no selection, allow Backspace to
+                // erase from the end instead of silently doing nothing.
+                if (!edit->hasSelectedText() && edit->cursorPosition() == 0 &&
+                    !edit->text().isEmpty())
+                    edit->setCursorPosition(edit->text().size());
+                edit->backspace();
+                return;
+            }
+            if (qtKey == Qt::Key_unknown && !text.isEmpty()) {
+                edit->insert(text);
+                return;
+            }
+            target = edit;
+        }
         if (!target || isAncestorOf(target)) return;
         QKeyEvent press(QEvent::KeyPress, qtKey, Qt::NoModifier, text);
         QApplication::sendEvent(target, &press);
@@ -270,6 +301,7 @@ private:
     }
 
     QGridLayout *m_grid = nullptr;
+    QPointer<QLineEdit> m_lastLineEdit;
     std::vector<std::pair<QPushButton *, OsmKeyDef>> m_charKeys;
     bool m_shift   = false;
     bool m_caps    = false;

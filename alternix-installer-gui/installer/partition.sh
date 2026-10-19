@@ -25,8 +25,12 @@ list_disks() {
         local name size_bytes human model
         name=$(basename "$dev")
         case "$name" in
-            loop*|ram*|sr*|fd*|dm-*|zram*|md*) continue ;;
+            loop*|ram*|sr*|fd*|dm-*|zram*|md*|mmcblk*boot*|mmcblk*rpmb*) continue ;;
         esac
+        # eMMC exposes two special hardware boot regions (boot0/boot1).
+        # Only the main mmcblkN user-storage device is a valid install target.
+        # TYPE=disk also excludes partitions or other special block devices.
+        [[ "$(lsblk -dn -o TYPE "/dev/${name}" 2>/dev/null)" == disk ]] || continue
         [[ -f "${dev}/size" ]] || continue
         size_bytes=$(cat "${dev}/size" 2>/dev/null || echo 0)
         [[ "$size_bytes" -gt 0 ]] 2>/dev/null || continue
@@ -38,6 +42,28 @@ list_disks() {
         done
         [[ -z "$model" ]] && model="Unknown"
         printf "/dev/%s\t%s\t%s\n" "$name" "$human" "$model"
+    done
+}
+
+# Verify target independently of the GUI, TUI and unattended configuration.
+# This must run BEFORE wipefs/parted: never let a stale or malicious config
+# erase eMMC hardware boot areas, loop devices or the running medium.
+validate_target_disk() {
+    case "${TARGET_DISK:-}" in
+        /dev/mmcblk*boot*|/dev/mmcblk*rpmb*|/dev/loop*|/dev/ram*|/dev/dm-*|/dev/md*|/dev/zram*)
+            die "Unsafe installation target: ${TARGET_DISK} (not a user-storage disk)." ;;
+    esac
+    [[ -b "${TARGET_DISK:-}" ]] || die "Target disk does not exist: ${TARGET_DISK:-<empty>}"
+    [[ "$(lsblk -dn -o TYPE "$TARGET_DISK" 2>/dev/null)" == disk ]] ||         die "Target is not a whole disk: $TARGET_DISK"
+    [[ "$(lsblk -dn -o RO "$TARGET_DISK" 2>/dev/null | tr -d ' ')" == 0 ]] ||         die "Target disk is read-only: $TARGET_DISK"
+    # /run/live/medium is the best source for the installer USB because
+    # the live root / is an overlay and does not point to the USB disk.
+    local live_source live_pk
+    for live_source in /run/live/medium /lib/live/mount/medium /cdrom; do
+        live_source=$(findmnt -n -o SOURCE -T "$live_source" 2>/dev/null | head -1)
+        [[ -n "$live_source" && "$live_source" == /dev/* ]] || continue
+        live_pk=$(lsblk -no PKNAME "$live_source" 2>/dev/null | head -1)
+        [[ "/dev/$live_pk" != "$TARGET_DISK" ]] ||             die "Refusing to erase the running installation medium: $TARGET_DISK"
     done
 }
 
@@ -184,9 +210,10 @@ partition_guided() {
 _do_guided_partition() {
     local swap_mb="${1:-0}"
 
+    validate_target_disk
     info "Wiping existing partition table on ${TARGET_DISK}..."
-    wipefs -a "$TARGET_DISK" &>/dev/null
-    dd if=/dev/zero of="$TARGET_DISK" bs=1M count=10 &>/dev/null
+    wipefs -a "$TARGET_DISK" &>/dev/null || die "Cannot wipe $TARGET_DISK"
+    dd if=/dev/zero of="$TARGET_DISK" bs=1M count=10 status=none || die "Cannot initialise $TARGET_DISK"
 
     if [[ $USE_EFI -eq 1 ]]; then
         parted -s "$TARGET_DISK" mklabel gpt
@@ -253,8 +280,19 @@ _do_guided_partition() {
         [[ -n "$PART_HOME" ]] && PART_HOME="${TARGET_DISK}p${PART_HOME##${TARGET_DISK}}"
     fi
 
-    sleep 1
+    # eMMC partition nodes may take several seconds to appear.
     partprobe "$TARGET_DISK" 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=15 2>/dev/null || true
+    local part ready
+    for part in "$PART_ROOT" "$PART_BOOT" "$PART_EFI" "$PART_HOME" "$PART_SWAP"; do
+        [[ -z "$part" ]] && continue
+        ready=0
+        for (( i=0; i<15; i++ )); do
+            [[ -b "$part" ]] && { ready=1; break; }
+            sleep 1
+        done
+        [[ "$ready" -eq 1 ]] || die "Partition $part never appeared after disk setup."
+    done
 
     _format_partitions
 }
@@ -310,6 +348,9 @@ partition_manual() {
         die "No root partition assigned."
     fi
 
+    if [[ "$USE_EFI" -eq 1 && -z "$PART_EFI" ]]; then
+        die "EFI boot requires a FAT32 ESP. Assign an 'efi' partition first."
+    fi
     _format_partitions
 }
 
@@ -319,13 +360,17 @@ _format_partitions() {
 
     if [[ -n "$PART_EFI" ]]; then
         spin_start "Formatting EFI  (${PART_EFI})..."
-        mkfs.fat -F32 "$PART_EFI" &>/dev/null
+        if ! mkfs.fat -F32 "$PART_EFI" &>/dev/null; then
+            spin_stop; die "EFI filesystem creation failed on $PART_EFI"
+        fi
         spin_stop; ok "EFI formatted."
     fi
 
     if [[ -n "$PART_BOOT" ]]; then
         spin_start "Formatting /boot (${PART_BOOT})..."
-        mkfs.ext4 -F "$PART_BOOT" &>/dev/null
+        if ! mkfs.ext4 -F "$PART_BOOT" &>/dev/null; then
+            spin_stop; die "Boot filesystem creation failed on $PART_BOOT"
+        fi
         spin_stop; ok "/boot formatted."
     fi
 
@@ -372,24 +417,26 @@ mount_partitions() {
 
     if [[ -n "$PART_BOOT" ]]; then
         mkdir -p "${mnt}/boot"
-        mount "$PART_BOOT" "${mnt}/boot"
+        mount "$PART_BOOT" "${mnt}/boot" || die "Cannot mount /boot from $PART_BOOT"
+        mountpoint -q "${mnt}/boot" || die "/boot is not a mountpoint"
         ok "Mounted /boot"
     fi
 
     if [[ -n "$PART_EFI" ]]; then
         mkdir -p "${mnt}/boot/efi"
-        mount "$PART_EFI" "${mnt}/boot/efi"
+        mount "$PART_EFI" "${mnt}/boot/efi" || die "Cannot mount EFI partition $PART_EFI"
+        mountpoint -q "${mnt}/boot/efi" || die "/boot/efi is not a mountpoint"
         ok "Mounted /boot/efi"
     fi
 
     if [[ -n "$PART_HOME" ]]; then
         mkdir -p "${mnt}/home"
-        mount "$PART_HOME" "${mnt}/home"
+        mount "$PART_HOME" "${mnt}/home" || die "Cannot mount /home from $PART_HOME"
         ok "Mounted /home"
     fi
 
     if [[ -n "$PART_SWAP" ]]; then
-        swapon "$PART_SWAP"
+        swapon "$PART_SWAP" || die "Cannot enable swap on $PART_SWAP"
         ok "Swap enabled."
     fi
 }
@@ -407,6 +454,7 @@ setup_disk() {
     # UNATTENDED GUARDS — osm-install supplies these in
     # /tmp/alternix-install.conf. mount_partitions must still run.
     [[ -n "${TARGET_DISK:-}" ]] || select_disk
+    validate_target_disk
     if [[ -n "${PART_MODE:-}" ]]; then
         case "$PART_MODE" in
             guided) partition_guided ;;

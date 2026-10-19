@@ -181,8 +181,24 @@ _show_logs() {
 }
 
 _on_exit() {
-    rm -f /tmp/.alternix-installer-running
     local code=$?
+    rm -f /tmp/.alternix-installer-running
+    # The GUI launches this script with stdin closed. Any interactive
+    # recovery menu here would loop forever instead of reporting failure
+    # to QProcess. Preserve logs and return the actual nonzero status.
+    if [[ $code -ne 0 && "${ALTERNIX_UNATTENDED:-0}" -eq 1 ]]; then
+        echo "INSTALL FAILED (exit ${code}); see ${ALTERNIX_LOG}" >&2
+        if mountpoint -q "${ALTERNIX_MOUNT:-/mnt/alternix}" 2>/dev/null; then
+            local failed_dir="${ALTERNIX_MOUNT}/var/log/alternix-install"
+            mkdir -p "$failed_dir" 2>/dev/null || true
+            cp "${ALTERNIX_LOG}" "${failed_dir}/failed-install.log" 2>/dev/null || true
+        fi
+        if [[ -x "${INSTALLER_DIR}/alternix-media" ]]; then
+            bash "${INSTALLER_DIR}/alternix-media" savelog >/dev/null 2>&1 || true
+        fi
+        trap - EXIT
+        exit "$code"
+    fi
     if [[ $code -ne 0 ]]; then
         ALTERNIX_ERROR_SHOWN=1
         spin_stop 2>/dev/null || true
@@ -462,15 +478,36 @@ install_optional_components
 untune_target_dpkg
 
 if [[ "${ALTERNIX_COPY_INSTALL:-0}" -eq 1 ]]; then
-    finalise_copy
-    _install_bootloader
+    finalise_copy || die "Finalising the installed initramfs failed."
+    _install_bootloader || die "Bootloader installation failed."
 
-    # Fail loudly rather than reporting success on an unbootable disk.
-    if [[ ! -f "${ALTERNIX_MOUNT}/boot/grub/grub.cfg" ]]; then
-        err "grub.cfg was not created — the installed system will not boot."
-        err "Check the bootloader output above."
+    if [[ ! -s "${ALTERNIX_MOUNT}/boot/grub/grub.cfg" ]]; then
+        die "grub.cfg was not created — installation cannot be marked complete."
     fi
 fi
+
+# ════════════════════════════════════════════════════════════════
+# STAGE 10: Verify installation before claiming success
+# ════════════════════════════════════════════════════════════════
+# Refuse to report completion if a non-fatal stage recorded an error.
+if [[ "${ALTERNIX_ERROR_COUNT:-0}" -gt 0 ]]; then
+    die "Installation encountered ${ALTERNIX_ERROR_COUNT} error(s); see $ALTERNIX_LOG."
+fi
+[[ -s "${ALTERNIX_MOUNT}/etc/fstab" ]] || die "Installed fstab is missing."
+root_uuid=$(blkid -s UUID -o value "$PART_ROOT")
+[[ -n "$root_uuid" ]] || die "Installed root partition has no UUID."
+grep -Fq "UUID=${root_uuid}  /  " "${ALTERNIX_MOUNT}/etc/fstab" || \
+    die "Installed fstab does not reference the actual root UUID."
+[[ -s "${ALTERNIX_MOUNT}/boot/grub/grub.cfg" ]] || die "Installed GRUB configuration is missing."
+grep -Fq "root=UUID=${root_uuid}" "${ALTERNIX_MOUNT}/boot/grub/grub.cfg" || \
+    die "Installed GRUB does not reference the actual root UUID."
+if [[ "$USE_EFI" -eq 1 ]]; then
+    mountpoint -q "${ALTERNIX_MOUNT}/boot/efi" || die "EFI partition is not mounted."
+    [[ -f "${ALTERNIX_MOUNT}/boot/efi/EFI/BOOT/BOOTIA32.EFI" || \
+       -f "${ALTERNIX_MOUNT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || \
+        die "No EFI fallback loader found on the installed EFI partition."
+fi
+info "Boot verification: root UUID=${root_uuid}; GRUB and fstab agree."
 
 # ════════════════════════════════════════════════════════════════
 # STAGE 10: Done

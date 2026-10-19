@@ -38,21 +38,80 @@ _err()   { echo "  ✗ $*" >&2; }
 _die()   { _err "$*"; exit 1; }
 _step()  { echo ""; echo "  ══  $*  ══"; echo ""; }
 
+# Large FAT32 boot images may contain a full Linux initrd. The following
+# validation steps used to run completely silently, making a working ISO
+# appear frozen after the IA32 check. Keep the byte-for-byte checks, but
+# report the active operation and give periodic elapsed-time updates.
+# Coreutils timeout prevents a stalled mtools process from hanging forever.
+ALTERNIX_VERIFY_TIMEOUT_SECONDS="${ALTERNIX_VERIFY_TIMEOUT_SECONDS:-1800}"
+[[ "$ALTERNIX_VERIFY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+    _die "ALTERNIX_VERIFY_TIMEOUT_SECONDS must be a positive integer."
+
+_monitored_cmd() {  # label command args...
+    local description="$1" log_file command_pid elapsed=0 status=0
+    shift
+    log_file=$(mktemp) || return 1
+    printf '%s | START | %s\n' "$(date -Is)" "$description" >> "${BUILD_DIR}/iso-verification.log"
+    timeout --kill-after=10s "${ALTERNIX_VERIFY_TIMEOUT_SECONDS}s" "$@" </dev/null > "$log_file" 2>&1 &
+    command_pid=$!
+    while kill -0 "$command_pid" 2>/dev/null; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        if (( elapsed % 15 == 0 )); then
+            _info "${description}: ${elapsed}s elapsed; operation still running..."
+        fi
+    done
+    if wait "$command_pid"; then
+        printf '%s | OK | %s | %ss\n' "$(date -Is)" "$description" "$elapsed" >> "${BUILD_DIR}/iso-verification.log"
+        rm -f "$log_file"
+        return 0
+    else
+        status=$?
+        _err "${description}: failed with exit code ${status} after ${elapsed}s."
+        if (( status == 124 || status == 137 )); then
+            _err "Operation exceeded the verification timeout (${ALTERNIX_VERIFY_TIMEOUT_SECONDS}s)."
+        fi
+        if [[ -s "$log_file" ]]; then
+            _err "Command output (last 20 lines):"
+            tail -20 "$log_file" >&2
+        fi
+        printf '%s | FAIL | %s | code=%s | %ss\n' "$(date -Is)" "$description" "$status" "$elapsed" >> "${BUILD_DIR}/iso-verification.log"
+        rm -f "$log_file"
+        return "$status"
+    fi
+}
+
 # ── Root check ────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || _die "Run as root: sudo bash build-iso.sh"
 
 # ── Dependencies ──────────────────────────────────────────────────
 _step "Checking dependencies"
 
-for dep in live-build debootstrap xorriso grub-pc-bin grub-efi-amd64-bin isolinux syslinux-utils; do
-    if ! dpkg -l "$dep" &>/dev/null; then
-        _info "Installing ${dep}..."
-        apt-get install -y "$dep" &>/dev/null
+# Both EFI platforms are required: amd64 for Visor/GRUB and i386-efi for
+# tablets with 32-bit firmware. mtools/dosfstools rebuild the hybrid ISO ESP.
+# IMPORTANT: `dpkg -l package` can exit 0 even for a "un" (not installed)
+# package entry. Check the status string rather than the command exit code.
+_pkg_installed() {
+    [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true)" == "install ok installed" ]]
+}
+
+missing_deps=()
+for dep in live-build debootstrap xorriso grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin grub2-common mtools dosfstools isolinux syslinux-utils; do
+    if ! _pkg_installed "$dep"; then
+        missing_deps+=("$dep")
     fi
 done
+if (( ${#missing_deps[@]} > 0 )); then
+    _info "Installing missing build packages: ${missing_deps[*]}"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_deps[@]}" || \
+        _die "Cannot install required build packages: ${missing_deps[*]} (check APT sources and run apt-get update)."
+    for dep in "${missing_deps[@]}"; do
+        _pkg_installed "$dep" || _die "Package $dep is still not installed after APT finished."
+    done
+fi
 
 # Install Devuan keyring so debootstrap can verify signatures
-if ! dpkg -l devuan-keyring &>/dev/null; then
+if ! _pkg_installed devuan-keyring; then
     _info "Installing Devuan keyring..."
     # Fetch and install the keyring package directly
     # Find the actual current keyring deb from the pool index
@@ -77,6 +136,41 @@ fi
 _info "Devuan keyring: ${DEVUAN_KEYRING}"
 
 _ok "Dependencies OK."
+
+# Fail before the slow live-build stage if the FAT image tools are absent.
+# A binary hook may receive a different PATH, so it also searches absolute
+# /usr/sbin and /sbin paths when choosing mkfs.fat.
+export PATH="${PATH:-/usr/bin:/bin}:/usr/sbin:/sbin:/usr/local/sbin"
+if ! command -v mcopy >/dev/null 2>&1 || ! command -v mdir >/dev/null 2>&1; then
+    _die "mtools utilities (mcopy/mdir) not found. Install mtools on the build host."
+fi
+_fat_formatter_available() {
+    local candidate
+    for candidate in /usr/sbin/mkfs.fat /sbin/mkfs.fat \
+                     /usr/sbin/mkfs.vfat /sbin/mkfs.vfat \
+                     /usr/sbin/mkfs.msdos /sbin/mkfs.msdos \
+                     mkfs.fat mkfs.vfat mkfs.msdos; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+if ! _fat_formatter_available; then
+    _info "dosfstools is registered but its FAT formatter is missing; repairing installation..."
+    DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y dosfstools || \
+        _die "Could not reinstall dosfstools. Check APT sources and try: sudo apt-get install --reinstall dosfstools"
+    hash -r
+    _fat_formatter_available || \
+        _die "FAT formatter still unavailable after reinstalling dosfstools. Check: dpkg -L dosfstools | grep mkfs"
+fi
+_ok "FAT image tools available."
+
+# Regression guard: FAT12/16/32 labels are limited to 11 characters.
+# Keep the embedded EFI image label short; this is independent of the
+# ISO9660 volume name and does not change the firmware boot selection.
+EFI_FAT_LABEL=ALTERNIX
+[[ "${#EFI_FAT_LABEL}" -le 11 ]] || _die "EFI FAT volume label exceeds 11 characters."
 
 # ── Clean build dir ───────────────────────────────────────────────
 _step "Preparing build directory"
@@ -159,6 +253,8 @@ lb config \
     --iso-publisher "Alternix" \
     --apt-indices "false" \
     --apt-recommends "false" \
+    --firmware-chroot "false" \
+    --firmware-binary "false" \
     --apt-source-archives "false" \
     "${COMPRESSION_ARG[@]}" \
     --debootstrap-options "--variant=minbase --keyring=${DEVUAN_KEYRING}"
@@ -171,6 +267,25 @@ _ok "live-build configured."
 # Set LB_INITSYSTEM=none so live-build does not try to install live-config-systemd.
 # We add live-config-sysvinit explicitly in our package list instead.
 echo 'LB_INITSYSTEM="none"' >> config/common
+
+# Do NOT let live-build auto-select every package which installs files into
+# /lib/firmware.  It includes firmware-b43legacy-installer (and b43-installer),
+# whose postinst downloads proprietary firmware from third-party URLs.
+# On 2026-10-18 that download timed out in chroot, breaking the entire build.
+# We list real, self-contained firmware packages explicitly below instead.
+# Force the settings in config files as well as lb config flags; some live-build
+# versions accept a flag but later regenerate defaults from config/common.
+for _cfg in config/common config/chroot config/binary; do
+    [[ -f "$_cfg" ]] || continue
+    for _fw_var in LB_FIRMWARE_CHROOT LB_FIRMWARE_BINARY; do
+        if grep -q "^${_fw_var}=" "$_cfg"; then
+            sed -i "s|^${_fw_var}=.*|${_fw_var}=\"false\"|" "$_cfg"
+        else
+            printf '%s="false"\n' "$_fw_var" >> "$_cfg"
+        fi
+    done
+done
+_ok "Automatic firmware selection disabled; curated firmware packages retained."
 
 # NO SOURCE PACKAGE INDICES — DO NOT RE-ENABLE
 # live-build defaults to adding deb-src lines, so every apt-get update in
@@ -239,6 +354,43 @@ cp "$DEVUAN_KEYRING" config/archives/devuan.key
 # Only copy the keyring — live-build writes sources.list from --mirror flags.
 # Adding devuan.list here causes "configured multiple times" warnings.
 
+
+# ── Keep the live installer awake on all boot architectures ─────────
+# Both IA32 UEFI and x64 UEFI launch the same amd64 live root filesystem.
+# Mask systemd sleep targets by shipping /etc/systemd/system/* -> /dev/null,
+# even though this Devuan ISO normally uses sysvinit/OpenRC rather than systemd.
+# elogind is the actual seat/power manager on the live ISO; explicit config
+# below is essential because masking systemd units alone does not stop it.
+_step "Disabling installer suspend, hibernate and hybrid sleep"
+LIVE_SLEEP_MASK_DIR="config/includes.chroot/etc/systemd/system"
+mkdir -p "$LIVE_SLEEP_MASK_DIR" \
+    config/includes.chroot/etc/elogind/sleep.conf.d \
+    config/includes.chroot/etc/elogind/logind.conf.d \
+    config/includes.chroot/etc/systemd/sleep.conf.d
+for sleep_unit in sleep.target suspend.target hibernate.target \
+                  hybrid-sleep.target suspend-then-hibernate.target; do
+    ln -sfn /dev/null "$LIVE_SLEEP_MASK_DIR/$sleep_unit"
+done
+cat > config/includes.chroot/etc/elogind/sleep.conf.d/90-alternix-installer-awake.conf << 'AWAKEEOF'
+[Sleep]
+AllowSuspend=no
+AllowHibernation=no
+AllowHybridSleep=no
+AllowSuspendThenHibernate=no
+AWAKEEOF
+cat > config/includes.chroot/etc/elogind/logind.conf.d/90-alternix-installer-awake.conf << 'AWAKEEOF'
+[Login]
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+IdleAction=ignore
+AWAKEEOF
+# Kept as a defence-in-depth fallback if a different init is chosen.
+cp config/includes.chroot/etc/elogind/sleep.conf.d/90-alternix-installer-awake.conf \
+   config/includes.chroot/etc/systemd/sleep.conf.d/90-alternix-installer-awake.conf
+_ok "Installer sleep targets masked; elogind suspend/hibernate disabled."
 
 # ── Block systemd packages via apt preferences ────────────────────
 mkdir -p config/includes.chroot/etc/apt/preferences.d
@@ -355,6 +507,7 @@ os-prober
 grub2-common
 grub-pc-bin
 grub-efi-amd64-bin
+grub-efi-ia32-bin
 
 # ── Terminal / UI ─────────────────────────────────────────────────
 tmux
@@ -445,6 +598,40 @@ gnu-efi
 
 # ── Extra firmware ────────────────────────────────────────────────
 # COPY INSTALL REQUIREMENT — DO NOT TRIM
+# Previously auto-discovered firmware, now explicitly selected.  These
+# packages all resolved in the user's 2026-10-18 Excalibur build log.
+# Crucially, omit firmware-b43-installer and firmware-b43legacy-installer:
+# their post-install scripts fetch proprietary driver archives over the
+# network and will abort the entire ISO build if a third-party host fails.
+# firmware-brcm80211, below, still covers modern Broadcom adapters.
+atmel-firmware
+firmware-amd-graphics
+firmware-ast
+firmware-ath9k-htc
+firmware-bnx2
+firmware-bnx2x
+firmware-carl9170
+firmware-cavium
+firmware-cirrus
+firmware-intel-graphics
+firmware-intel-misc
+# Do not include firmware-ipw2x00 or firmware-ivtv in an unattended ISO build.
+# Both require explicit licence acceptance in their dpkg preinst scripts;
+# DEBIAN_FRONTEND=noninteractive cannot answer those questions, so dpkg exits 2.
+# Older Intel PRO/Wireless 2100/2200/2915 and Hauppauge capture devices may
+# need optional, interactive firmware installation after first boot.
+firmware-linux
+firmware-linux-nonfree
+firmware-marvell-prestera
+firmware-mediatek
+firmware-myricom
+firmware-netronome
+firmware-netxen
+firmware-nvidia-graphics
+firmware-nvidia-tesla-535-gsp
+firmware-qlogic
+firmware-siano
+firmware-zd1211
 # The copy install has no network package step, so any firmware not
 # baked into this image does not exist on the installed system. With
 # debootstrap a missing WiFi blob could be fetched mid-install; here
@@ -464,6 +651,20 @@ pciutils
 fdisk
 EOF
 
+# Catch accidentally reintroduced packages that break unattended builds.
+# B43 installer packages download external files while dpkg is configuring;
+# ipw2x00 and ivtv have mandatory interactive EULA prompts during preinst.
+# The APT non-recommends setting above ensures optional recommendations do not
+# silently pull these packages in through firmware meta-packages.
+if grep -Eq '^[[:space:]]*firmware-b43(legacy)?-installer([[:space:]]|$)' \
+    config/package-lists/alternix-installer.list.chroot; then
+    _die "Network-dependent Broadcom firmware installer packages must not be in the live image."
+fi
+if grep -Eq '^[[:space:]]*firmware-(ipw2x00|ivtv)([[:space:]]|$)' \
+    config/package-lists/alternix-installer.list.chroot; then
+    _die "firmware-ipw2x00 and firmware-ivtv require interactive licence acceptance; cannot install unattended."
+fi
+_ok "Firmware selection: unattended-safe packages; no third-party downloaders or licence prompts."
 _ok "Package lists written."
 
 # ── Copy installer scripts ────────────────────────────────────────
@@ -912,42 +1113,29 @@ if background_image /boot/grub/background.png; then
     set color_highlight=white/cyan
 fi
 
-# Use search to find the versioned kernel and initrd automatically
-set default=0
-set timeout=5
-
-if background_image /boot/grub/background.png; then
-    set color_normal=cyan/black
-    set color_highlight=white/cyan
-fi
-
-# KERNEL PATH FIX — DO NOT REMOVE
-# grub.cfg uses UNVERSIONED /live/vmlinuz and /live/initrd.img.
-# The binary hook below copies the versioned kernel to these names,
-# so kernel updates can never break the ISO boot.
-
+# Unversioned names are created by the 9999 binary hook.
 menuentry "Install Alternix" {
-    search --no-floppy --label --set=root Alternix-Installer
-    linux  ($root)/live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer quiet
-    initrd ($root)/live/initrd.img
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer quiet
+    initrd /live/initrd.img
 }
 
 menuentry "Install Alternix (text mode)" {
-    search --no-floppy --label --set=root Alternix-Installer
-    linux  ($root)/live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 quiet
-    initrd ($root)/live/initrd.img
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 quiet
+    initrd /live/initrd.img
 }
 
 menuentry "Install Alternix (nomodeset)" {
-    search --no-floppy --label --set=root Alternix-Installer
-    linux  ($root)/live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer nomodeset
-    initrd ($root)/live/initrd.img
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer nomodeset
+    initrd /live/initrd.img
 }
 
 menuentry "Install Alternix (safe mode, text)" {
-    search --no-floppy --label --set=root Alternix-Installer
-    linux  ($root)/live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 noapic noacpi nomodeset
-    initrd ($root)/live/initrd.img
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 noapic noacpi nomodeset
+    initrd /live/initrd.img
 }
 EOF
 
@@ -996,38 +1184,157 @@ fi
 HOOKEOF
 chmod +x config/hooks/normal/9999-fix-grub-kernel.hook.binary
 
-# ── EFI boot menu: Visor (64-bit) and your 32-bit loader ─────────
-# Two things go into the ISO's EFI directory here, and both must be
-# placed AFTER live-build has written its own GRUB loaders, which it does
-# in binary_grub-efi. binary_includes runs before that step, so anything
-# staged under config/includes.binary/EFI would be overwritten. Both are
-# therefore staged OUTSIDE the EFI tree and moved into place by a binary
-# hook, which live-build runs after binary_grub-efi.
-#
-# ONE EFI BOOT DIRECTORY — THE BUG THIS AVOIDS
-# The ISO filesystem is case-sensitive; FAT32 is not. An earlier version
-# created EFI/BOOT alongside live-build's own directory. When Rufus copies
-# the ISO onto a FAT32 stick, EFI/BOOT and EFI/boot become the same
-# directory and whichever file is written last survives, which silently
-# discarded boot32.efi in favour of live-build's own 32-bit GRUB. The hook
-# now writes into whichever EFI boot directory already exists, and
-# matches the filename case of the 64-bit loader beside it.
-_step "Preparing EFI boot menu"
+# ── EFI boot menu: Visor (64-bit), standalone GRUB (32-bit) ───────
+# A plain bootia32.efi does NOT automatically gain the live-build GRUB
+# configuration. Build a self-contained i386-efi GRUB with its own text
+# installer menu embedded in the EFI executable. This works from both a
+# file-copied FAT USB (Rufus ISO mode) and the hybrid ISO's EFI image.
+# Never chainload Visor from i386-efi: Visor only supports x86_64 EFI.
+_step "Preparing 32-bit UEFI GRUB text menu"
 
-EFI_STAGE="config/includes.binary/.alternix-efi"
+EFI_STAGE="config/includes.binary/alternix-efi-stage"
 rm -rf "$EFI_STAGE"
 mkdir -p "$EFI_STAGE"
 
-EFI32_SRC="${SCRIPT_DIR}/efi/boot32.efi"
-if [[ -f "$EFI32_SRC" ]]; then
-    cp "$EFI32_SRC" "${EFI_STAGE}/boot32.efi"
-    _ok "32-bit UEFI loader staged from ${EFI32_SRC}"
-else
-    mkdir -p "${SCRIPT_DIR}/efi"
-    _info "No 32-bit UEFI loader at ${EFI32_SRC}."
-    _info "Tablets with 32-bit UEFI firmware (Bay Trail, Cherry Trail)"
-    _info "will not boot this ISO. Put the loader there and rebuild."
+if [[ -f "${SCRIPT_DIR}/efi/bootia32.efi" || -f "${SCRIPT_DIR}/efi/BOOTIA32.EFI" ]]; then
+    _info "Existing efi/bootia32.efi found; using a newly built standalone GRUB instead."
+    _info "This ensures 32-bit EFI loads the installer menu rather than trying Visor."
 fi
+
+# Embedded IA32 GRUB menu with two independent UEFI display routes.
+# Several early x86 tablet firmwares do not present a usable EFI Simple Text
+# Output Protocol (black screen), even though GOP has a working framebuffer.
+# Keep console active for devices which already work (such as Linx tablets),
+# while *appending* GOP-backed gfxterm when the firmware supports it. Do not
+# replace console with gfxterm: that would regress other tablets.
+# Both the font and config live inside BOOTIA32.EFI's GRUB memdisk.
+cat > "$EFI_STAGE/grub-ia32.cfg" << 'IA32CFG'
+set default=0
+set timeout=12
+set pager=1
+terminal_input console
+terminal_output console
+set color_normal=white/black
+set color_highlight=black/light-gray
+
+echo 'Alternix: IA32 GRUB entered using UEFI console.'
+# Try graphics WITHOUT turning off firmware console. No reliance on files
+# located on the EFI System Partition or the external ISO filesystem.
+if insmod efi_gop; then
+    if insmod gfxterm; then
+        if loadfont $prefix/fonts/unicode.pf2; then
+            set gfxmode=auto
+            if terminal_output --append gfxterm; then
+                set gfxpayload=keep
+                echo 'Alternix: GOP framebuffer text output enabled.'
+            fi
+        fi
+    fi
+fi
+echo 'Alternix: 32-bit UEFI GRUB started (64-bit firmware uses Visor).'
+
+# GRUB can see ISO9660 media (dd) and FAT USB sticks (Rufus ISO mode).
+# Do NOT search for the ESP: on dd media it only contains bootloaders.
+menuentry "Install Alternix" {
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer quiet
+    initrd /live/initrd.img
+}
+menuentry "Install Alternix (text mode)" {
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 quiet
+    initrd /live/initrd.img
+}
+menuentry "Install Alternix (nomodeset)" {
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer nomodeset
+    initrd /live/initrd.img
+}
+menuentry "Install Alternix (safe mode, text)" {
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 noapic noacpi nomodeset
+    initrd /live/initrd.img
+}
+# Explicitly report kernel messages and avoid i915 if EFI->kernel handoff
+# causes a blank screen. This is only an alternative entry, not the default.
+menuentry "Install Alternix (verbose / Intel graphics off)" {
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 nomodeset i915.modeset=0 loglevel=7 ignore_loglevel plymouth.enable=0
+    initrd /live/initrd.img
+}
+# A no-kernel boot check; useful when a machine can show the GRUB menu but
+# hangs as soon as Linux is selected. It makes no disk modifications.
+menuentry "Diagnostics: verify GRUB and boot files (no Linux)" {
+    echo "Alternix EFI diagnostic (firmware arch: $grub_cpu/$grub_platform)"
+    if search --no-floppy --file --set=root /live/vmlinuz; then
+        echo "PASS: /live/vmlinuz found on $root"
+        if test -f /live/initrd.img; then
+            echo "PASS: /live/initrd.img found"
+        else
+            echo "ERROR: /live/initrd.img is missing"
+        fi
+    else
+        echo "ERROR: /live/vmlinuz not found: USB layout/media unreadable"
+    fi
+    echo 'Select any key to return to the GRUB menu.'
+    read
+}
+IA32CFG
+
+# Only load real i386-efi modules. There is NO search_fs_label.mod in
+# Debian/Devuan GRUB; the label-search module is called search_label.mod.
+# This menu searches by file, so search_fs_file is sufficient.
+IA32_GRUB_MOD_DIR="/usr/lib/grub/i386-efi"
+[[ -d "$IA32_GRUB_MOD_DIR" ]] || \
+    _die "Missing $IA32_GRUB_MOD_DIR. Install grub-efi-ia32-bin on the BUILD host."
+command -v grub-mkstandalone >/dev/null || \
+    _die "grub-mkstandalone is missing (install grub2-common)."
+IA32_GRUB_MODULES=(
+    normal linux part_gpt part_msdos fat iso9660 udf ext2
+    search search_fs_file configfile read test
+)
+for module in "${IA32_GRUB_MODULES[@]}"; do
+    [[ -f "$IA32_GRUB_MOD_DIR/${module}.mod" ]] || \
+        _die "Missing $IA32_GRUB_MOD_DIR/${module}.mod; reinstall grub-efi-ia32-bin."
+done
+# GOP is optional: retain the old EFI console-only loader if one of the
+# graphics components or the embedded font is not available on the host.
+IA32_FONT_ARG='--fonts='
+IA32_GOP_MODULES=(efi_gop gfxterm font video video_fb)
+IA32_GOP_READY=1
+for module in "${IA32_GOP_MODULES[@]}"; do
+    if [[ ! -f "$IA32_GRUB_MOD_DIR/${module}.mod" ]]; then
+        _info "Optional i386-efi graphics module unavailable: $module"
+        IA32_GOP_READY=0
+    fi
+done
+if [[ ! -s /usr/share/grub/unicode.pf2 ]]; then
+    _info 'GRUB Unicode font unavailable; GOP text output will not be enabled.'
+    IA32_GOP_READY=0
+fi
+if (( IA32_GOP_READY )); then
+    IA32_GRUB_MODULES+=("${IA32_GOP_MODULES[@]}")
+    IA32_FONT_ARG='--fonts=unicode'
+    _info 'Embedding GOP text-output support alongside UEFI console output.'
+else
+    _info 'Keeping original UEFI console-only output (GOP prerequisites missing).'
+fi
+_info "Using verified i386-efi GRUB modules (file-search installer menu)."
+# The grafted grub.cfg and optional font live inside the GRUB memdisk.
+if ! grub-mkstandalone -O i386-efi \
+    -o "$EFI_STAGE/bootia32.efi" \
+    "$IA32_FONT_ARG" --locales="" --themes="" \
+    --modules="${IA32_GRUB_MODULES[*]}" \
+    "boot/grub/grub.cfg=$EFI_STAGE/grub-ia32.cfg"; then
+    _die "Cannot build 32-bit GRUB; verify grub-efi-ia32-bin/grub2-common. ISO must not be marked as IA32-bootable."
+fi
+[[ -s "$EFI_STAGE/bootia32.efi" ]] || _die "32-bit GRUB EFI file is empty."
+_ok "Standalone i386-efi GRUB built with 5 installer choices and a boot-file diagnostic."
+
+# The firmware itself selects the EFI executable on removable media:
+#     EFI/BOOT/BOOTIA32.EFI  -> i386-efi GRUB (text installer)
+#     EFI/BOOT/BOOTX64.EFI  -> Visor (when available)
+# No per-device loader switching or external USB patch is necessary.
 
 # Build Visor inside the chroot, where gnu-efi and gcc already are. The
 # result is kept at /usr/share/alternix/visor so it serves two purposes:
@@ -1050,7 +1357,7 @@ if ! git clone --depth 1 -q https://github.com/IO-ZetZor/Visor-BootManager.git \
 fi
 
 # ARCH=x86_64 explicitly. Visor supports only x86_64 and aarch64; there
-# is no 32-bit UEFI build, so 32-bit tablets always boot via boot32.efi.
+# is no 32-bit UEFI build, so 32-bit firmware always boots via BOOTIA32.EFI.
 if ! ( cd /tmp/visor-build && make ARCH=x86_64 ) >>"$LOG" 2>&1 || \
    [ ! -f /tmp/visor-build/visor_x64.efi ]; then
     echo "  ! Visor build failed — ISO will use GRUB. Last lines:"
@@ -1070,56 +1377,238 @@ chmod +x config/hooks/normal/0085-visor.hook.chroot
 cat > config/hooks/normal/9998-alternix-efi.hook.binary << 'HOOKEOF'
 #!/bin/sh
 # Runs in binary/ after binary_grub-efi, before the ISO is assembled.
-STAGE=".alternix-efi"
+STAGE="alternix-efi-stage"
 VISOR="../chroot/usr/share/alternix/visor"
 
 # Find live-build's EFI boot directory, whatever case it used. Everything
 # goes in here so there is only ever one directory once on FAT32.
-BOOTDIR=$(find EFI -maxdepth 1 -type d -iname boot 2>/dev/null | head -1)
-if [ -z "$BOOTDIR" ]; then mkdir -p EFI/boot; BOOTDIR="EFI/boot"; fi
-if [ "$(find EFI -maxdepth 1 -type d -iname boot | wc -l)" -gt 1 ]; then
-    echo "efi: WARNING more than one EFI boot directory; they will collide on FAT32"
+BOOTDIR=$(find EFI -mindepth 1 -maxdepth 1 -type d -iname boot 2>/dev/null | head -1)
+if [ "$(find EFI -mindepth 1 -maxdepth 1 -type d -iname boot | wc -l)" -gt 1 ]; then
+    echo "efi: ERROR multiple differently cased EFI boot directories would collide on FAT32"
+    exit 1
 fi
+# Canonical, case-correct removable-media boot path on ISO9660 and FAT32.
+if [ -n "$BOOTDIR" ] && [ "$BOOTDIR" != "EFI/BOOT" ]; then
+    [ ! -e EFI/BOOT ] || { echo "efi: ERROR duplicate EFI/BOOT directory"; exit 1; }
+    mv "$BOOTDIR" EFI/BOOT || exit 1
+fi
+BOOTDIR="EFI/BOOT"
+mkdir -p "$BOOTDIR"
 
-# Match the case of the 64-bit loader already in that directory.
+# EFI.IMG HAS NO ROOM TO SPARE — DO NOT GO BACK TO A PLAIN mcopy
+# Sticks written with dd, Etcher or Rufus in DD mode boot from
+# boot/grub/efi.img, not from the EFI folder. live-build sizes that
+# image to fit its own small loaders with only ~55 KB spare, so copying
+# a full 32-bit loader over live-build's one failed with "Disk full",
+# the image kept live-build's loader, and 32-bit tablets would not boot
+# until bootia32.efi was copied onto the stick by hand. The image is
+# now rebuilt with room for it.
+# live-build may execute binary hooks with /usr/sbin and /sbin missing
+# from PATH. On current Debian/Devuan, dosfstools normally installs
+# /usr/sbin/mkfs.fat (mkfs.msdos is only an optional compatibility link).
+# Include standard admin directories and test the executable itself.
+PATH="${PATH:-/usr/bin:/bin}:/usr/sbin:/sbin:/usr/local/sbin"
+export PATH
+
+efi_img_put() {   # $1 = 32-bit loader to place in boot/grub/efi.img
+    IMG=boot/grub/efi.img
+    MKFS=""
+    for candidate in \
+        /usr/sbin/mkfs.fat /sbin/mkfs.fat \
+        /usr/sbin/mkfs.vfat /sbin/mkfs.vfat \
+        /usr/sbin/mkfs.msdos /sbin/mkfs.msdos \
+        mkfs.fat mkfs.vfat mkfs.msdos; do
+        # command -v accepts both absolute paths and commands in PATH.
+        if command -v "$candidate" >/dev/null 2>&1; then
+            MKFS=$(command -v "$candidate")
+            break
+        fi
+    done
+    if [ -z "$MKFS" ] || [ ! -x "$MKFS" ]; then
+        echo "efi: ERROR: dosfstools mkfs.fat executable is unavailable (tried /usr/sbin/mkfs.fat)."
+        return 1
+    fi
+    for utility in mcopy mdir; do
+        if ! command -v "$utility" >/dev/null 2>&1; then
+            echo "efi: ERROR: $utility is unavailable (install mtools on the build host)."
+            return 1
+        fi
+    done
+    echo "efi: building embedded FAT image with $MKFS"
+    export MTOOLS_SKIP_CHECK=1
+    TMP=$(mktemp -d)
+    mcopy -s -n -i "$IMG" '::*' "$TMP/" || { rm -rf "$TMP"; return 1; }
+
+    # EFI directory names are case-insensitive once copied into FAT32.
+    # Normalise the original live-build tree before inserting IA32 GRUB,
+    # avoiding both `efi/boot` and `EFI/BOOT` appearing on Linux.
+    OLDEFI=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d -iname efi | head -1)
+    if [ -n "$OLDEFI" ] && [ "$OLDEFI" != "$TMP/EFI" ]; then
+        [ ! -e "$TMP/EFI" ] || { echo "efi: ERROR duplicate EFI directories"; rm -rf "$TMP"; return 1; }
+        mv "$OLDEFI" "$TMP/EFI" || { rm -rf "$TMP"; return 1; }
+    fi
+    if [ -d "$TMP/EFI" ]; then
+        OLDBOOT=$(find "$TMP/EFI" -mindepth 1 -maxdepth 1 -type d -iname boot | head -1)
+        if [ -n "$OLDBOOT" ] && [ "$OLDBOOT" != "$TMP/EFI/BOOT" ]; then
+            [ ! -e "$TMP/EFI/BOOT" ] || { echo "efi: ERROR duplicate BOOT directories"; rm -rf "$TMP"; return 1; }
+            mv "$OLDBOOT" "$TMP/EFI/BOOT" || { rm -rf "$TMP"; return 1; }
+        fi
+    fi
+    mkdir -p "$TMP/EFI/BOOT"
+    find "$TMP" -type f -iname bootia32.efi -exec rm -f {} +
+    cp "$1" "$TMP/EFI/BOOT/BOOTIA32.EFI" || { rm -rf "$TMP"; return 1; }
+
+    # On raw/DD-written USB media firmware reads this FAT EFI image, NOT
+    # the ISO9660 /EFI directory. The previous build left BOOTX64.EFI as
+    # GRUB here even after Visor had been built successfully. Stage the
+    # same x64 Visor menu, boot.conf, kernel and initrd in this image so
+    # x64 firmware sees the working installed-system style boot layout.
+    if [ -s "EFI/visor/visor_x64.efi" ] && [ -s "$BOOTDIR/$N64" ]; then
+        [ -s EFI/visor/boot.conf ] || {
+            echo "efi: ERROR: Visor exists but boot.conf is missing"
+            rm -rf "$TMP"; return 1
+        }
+        # Save GRUB before replacing the original x64 boot file. Prefer
+        # the ISO tree fallback, which is guaranteed to contain the GRUB
+        # loader before Visor was installed. Handle either filename case
+        # from live-build's original FAT image.
+        ORIGINAL_X64=$(find "$TMP/EFI/BOOT" -maxdepth 1 -type f \
+            -iname bootx64.efi -print -quit)
+        if [ -s "$BOOTDIR/grubx64-alternix.efi" ]; then
+            cp "$BOOTDIR/grubx64-alternix.efi" \
+                "$TMP/EFI/BOOT/grubx64-alternix.efi" || {
+                rm -rf "$TMP"; return 1
+            }
+        elif [ -n "$ORIGINAL_X64" ] && [ -s "$ORIGINAL_X64" ]; then
+            cp "$ORIGINAL_X64" "$TMP/EFI/BOOT/grubx64-alternix.efi" || {
+                rm -rf "$TMP"; return 1
+            }
+        else
+            echo "efi: ERROR: no x64 GRUB fallback for Visor"
+            rm -rf "$TMP"; return 1
+        fi
+        # IMPORTANT: Linux filesystems are case-sensitive; FAT32 is not.
+        # An original bootx64.efi and a new BOOTX64.EFI are different files
+        # in TMP, but COLLIDE on FAT32. The second mcopy can silently
+        # overwrite the first. Remove ALL case variants BEFORE inserting
+        # Visor, so exactly one canonical BOOTX64.EFI enters the image.
+        find "$TMP/EFI/BOOT" -maxdepth 1 -type f -iname bootx64.efi \
+            -exec rm -f {} +
+        cp "$BOOTDIR/$N64" "$TMP/EFI/BOOT/BOOTX64.EFI" || {
+            rm -rf "$TMP"; return 1
+        }
+        X64_COPIES=$(find "$TMP/EFI/BOOT" -maxdepth 1 -type f \
+            -iname bootx64.efi | wc -l)
+        if [ "$X64_COPIES" -ne 1 ]; then
+            echo "efi: ERROR: expected exactly one x64 EFI loader, found $X64_COPIES"
+            rm -rf "$TMP"; return 1
+        fi
+        echo "efi: canonical BOOTX64.EFI staged (no FAT32 case collision)"
+        rm -rf "$TMP/EFI/visor"
+        cp -R EFI/visor "$TMP/EFI/visor" || { rm -rf "$TMP"; return 1; }
+        mkdir -p "$TMP/live"
+        for name in vmlinuz initrd.img; do
+            source_file=""
+            if [ -s "live/$name" ]; then
+                source_file="live/$name"
+            else
+                # Match the last versioned file selected by the 9999
+                # unversioned-kernel hook (lexicographic sort order).
+                for candidate in "live/$name"-*; do
+                    [ -s "$candidate" ] && source_file="$candidate"
+                done
+            fi
+            if [ -z "$source_file" ]; then
+                echo "efi: ERROR: missing live/$name for FAT32 Visor boot"
+                rm -rf "$TMP"; return 1
+            fi
+            cp "$source_file" "$TMP/live/$name" || { rm -rf "$TMP"; return 1; }
+            echo "efi: staged $source_file for x64 Visor on raw USB media"
+        done
+        echo "efi: x64 Visor, its configuration, kernel and initrd staged in FAT32 EFI image"
+    fi
+
+    # Many tablet UEFI implementations are picky about FAT12/FAT16 boot
+    # images. mkfs.fat otherwise auto-selects a small FAT type. Use an
+    # explicit FAT32 ESP of at least 64 MiB for the hybrid ISO image.
+    # Preserve original live-build files (including the x64 loader).
+    KB=$(du -sk "$TMP" | cut -f1)
+    KB=$(( (KB + 8192 + 1023) / 1024 * 1024 ))
+    [ "$KB" -ge 65536 ] || KB=65536
+    rm -f "$IMG.new"
+    # FAT volume labels are at most 11 characters. The old label
+    # ALTERNIX_EFI (12 characters) caused mkfs.fat to abort here after
+    # the whole live-build chroot had already completed.
+    EFI_FAT_LABEL=ALTERNIX
+    if [ "${#EFI_FAT_LABEL}" -gt 11 ]; then
+        echo "efi: ERROR FAT label is longer than 11 characters: $EFI_FAT_LABEL"
+        rm -rf "$TMP" "$IMG.new"
+        return 1
+    fi
+    if "$MKFS" -F 32 -n "$EFI_FAT_LABEL" -C "$IMG.new" "$KB" >/dev/null && \
+       mcopy -s -i "$IMG.new" "$TMP"/* ::/ && \
+       mdir -i "$IMG.new" ::/EFI/BOOT/BOOTIA32.EFI >/dev/null 2>&1; then
+        # Detect x64 replacement failures HERE, before the final ISO is
+        # assembled. In particular, catch FAT32 case-insensitive filename
+        # collisions that can silently restore live-build's old GRUB.
+        if [ -s "EFI/visor/visor_x64.efi" ]; then
+            FAT_X64_CHECK=$(mktemp -d)
+            if ! mcopy -o -i "$IMG.new" ::/EFI/BOOT/BOOTX64.EFI \
+                    "$FAT_X64_CHECK/BOOTX64.EFI" >/dev/null 2>&1; then
+                echo 'efi: ERROR: rebuilt FAT32 image cannot extract BOOTX64.EFI'
+                rm -rf "$FAT_X64_CHECK" "$TMP" "$IMG.new"
+                return 1
+            fi
+            if ! cmp -s "$FAT_X64_CHECK/BOOTX64.EFI" "$BOOTDIR/$N64"; then
+                echo 'efi: ERROR: rebuilt FAT32 image has a different x64 loader (not Visor)'
+                sha256sum "$BOOTDIR/$N64" "$FAT_X64_CHECK/BOOTX64.EFI" 2>/dev/null || true
+                rm -rf "$FAT_X64_CHECK" "$TMP" "$IMG.new"
+                return 1
+            fi
+            rm -rf "$FAT_X64_CHECK"
+            echo 'efi: verified embedded BOOTX64.EFI is Visor (matching SHA256 bytes)'
+        fi
+        # FAT32 has its type signature at offset 82 in the boot sector.
+        FAT_TYPE=$(dd if="$IMG.new" bs=1 skip=82 count=8 2>/dev/null)
+        if [ "$FAT_TYPE" = 'FAT32   ' ]; then
+            mv -f "$IMG.new" "$IMG"
+            rm -rf "$TMP"
+            return 0
+        fi
+        echo "efi: ERROR embedded EFI filesystem is not FAT32."
+    fi
+    rm -rf "$TMP" "$IMG.new"
+    return 1
+}
+
+# EFI removable-media filenames are always written in canonical casing.
 X64=$(find "$BOOTDIR" -maxdepth 1 -type f -iname bootx64.efi | head -1)
-case "$(basename "${X64:-bootx64.efi}")" in
-    BOOTX64.EFI) N32="BOOTIA32.EFI"; N64="BOOTX64.EFI" ;;
-    *)           N32="bootia32.efi"; N64="bootx64.efi" ;;
-esac
+N32="BOOTIA32.EFI"
+N64="BOOTX64.EFI"
 echo "efi: boot directory is $BOOTDIR"
 
 # ── 32-bit loader ─────────────────────────────────────────────────
-if [ -f "$STAGE/boot32.efi" ]; then
-    # Remove every existing 32-bit loader in any case, then place ours.
-    find "$BOOTDIR" -maxdepth 1 -type f -iname bootia32.efi -exec rm -f {} +
-    cp "$STAGE/boot32.efi" "$BOOTDIR/$N32"
-    cp "$STAGE/boot32.efi" "$BOOTDIR/boot32.efi"
-    echo "efi: 32-bit loader installed as $BOOTDIR/$N32"
-
-    # Also into the embedded EFI partition read by dd-written media.
-    # FAT is case-insensitive, so this overwrites live-build's copy
-    # whatever case it has there.
-    if [ -f boot/grub/efi.img ]; then
-        command -v mcopy >/dev/null 2>&1 || apt-get install -y mtools >/dev/null 2>&1 || true
-        if command -v mcopy >/dev/null 2>&1; then
-            mmd -i boot/grub/efi.img ::/EFI      2>/dev/null || true
-            mmd -i boot/grub/efi.img ::/EFI/BOOT 2>/dev/null || true
-            if mcopy -o -i boot/grub/efi.img "$STAGE/boot32.efi" ::/EFI/BOOT/BOOTIA32.EFI; then
-                echo "efi: 32-bit loader installed into boot/grub/efi.img"
-            else
-                echo "efi: WARNING could not write efi.img; dd-written media will not boot 32-bit UEFI"
-            fi
-        fi
-    fi
+if [ ! -s "$STAGE/bootia32.efi" ]; then
+    echo "efi: ERROR missing standalone 32-bit GRUB"
+    exit 1
 fi
+# The only canonical FAT file is BOOTIA32.EFI. The boot32.efi alias is not
+# an EFI removable-media fallback and used to confuse diagnostics.
+find "$BOOTDIR" -maxdepth 1 -type f -iname bootia32.efi -exec rm -f {} +
+cp "$STAGE/bootia32.efi" "$BOOTDIR/$N32" || exit 1
+echo "efi: 32-bit GRUB text selector installed as $BOOTDIR/$N32"
+
+# Both the ISO tree and the embedded FAT EFI boot image are populated.
+# EFI image rebuilding runs AFTER Visor's configuration is written so
+# extracted USB, DD USB and optical EFI media present the same menus.
+
+# The 32-bit GRUB is installed automatically for every ISO and every USB.
+# Do not add device-specific bootloader switch scripts or compatibility files.
 
 # ── Visor as the 64-bit boot menu ─────────────────────────────────
-# Visor reads kernels from the FAT volume it booted from. On a stick
-# written by Rufus in ISO Image mode that volume holds \live\vmlinuz,
-# so Visor boots the live system directly. On a dd-written stick the
-# firmware boots boot/grub/efi.img instead, which does not contain the
-# kernel, so efi.img is deliberately left running GRUB.
+# Visor reads kernels and initrds from the FAT filesystem that launched
+# it. Stage these files into the embedded FAT image for DD-written media,
+# not only into the ordinary ISO tree used by extracted FAT USB media.
 if [ -f "$VISOR/visor_x64.efi" ]; then
     mkdir -p EFI/visor/icons EFI/visor/backgrounds
     cp "$VISOR/visor_x64.efi" EFI/visor/
@@ -1178,7 +1667,25 @@ if [ -f "$VISOR/visor_x64.efi" ]; then
     } > EFI/visor/boot.conf
     echo "efi: Visor installed as $BOOTDIR/$N64 (GRUB kept as a menu entry)"
 else
-    echo "efi: Visor not built; the ISO keeps live-build's GRUB menu."
+    if [ -n "$X64" ] && [ -s "$X64" ] && [ "$X64" != "$BOOTDIR/$N64" ]; then
+        mv "$X64" "$BOOTDIR/$N64" || exit 1
+    fi
+    echo "efi: Visor not built; the ISO keeps live-build's x64 GRUB menu."
+fi
+
+# Rebuild after Visor and its config have been placed into the ISO tree.
+# Do not assume that the ISO9660 EFI/ directory is the removable-media
+# ESP; x64 and IA32 firmware boot the ESP in boot/grub/efi.img on DD USB.
+if [ -f boot/grub/efi.img ]; then
+    if efi_img_put "$STAGE/bootia32.efi"; then
+        echo "efi: IA32 GRUB and x64 boot files embedded in boot/grub/efi.img ($(du -k boot/grub/efi.img | cut -f1) KB)"
+    else
+        echo "efi: ERROR cannot rebuild embedded EFI image; see preceding mkfs.fat/mtools error"
+        exit 1
+    fi
+else
+    echo "efi: ERROR boot/grub/efi.img is missing; DD-written UEFI media could not boot"
+    exit 1
 fi
 
 rm -rf "$STAGE"
@@ -1187,38 +1694,237 @@ chmod +x config/hooks/normal/9998-alternix-efi.hook.binary
 _ok "EFI boot menu hook written."
 
 # ── Build ─────────────────────────────────────────────────────────
-_step "Building ISO (this will take a while...)"
+_step "Building Devuan ISO (automatic package mirror failover)"
 
 LB_LOG="${BUILD_DIR}/lb-build.log"
-lb build 2>&1 | tee "$LB_LOG" | while IFS= read -r line; do
-    echo "  ${line}"
-done
-# tee exits 0 — check the log for lb failure marker instead
-if grep -qE "^E:|^lb build failed" "$LB_LOG" 2>/dev/null; then
-    # A broken or mid-sync mirror is the one failure with a known,
-    # immediate fix, so name it and give the exact command rather than
-    # leaving it to be dug out of the log.
-    if grep -q "Mirror sync in progress" "$LB_LOG" 2>/dev/null; then
-        _bad=$(grep -oE "Mirror sync in progress\? \[IP: [0-9.]+" "$LB_LOG" \
-               | grep -oE "[0-9.]+$" | sort -u | tr '\n' ' ')
-        echo ""
-        echo "  ══════════════════════════════════════════════════════════"
-        echo "  The build failed because a package mirror is out of sync:"
-        echo "  its index does not match its own files. This is a problem"
-        echo "  with the mirror, not with the build."
-        [[ -n "$_bad" ]] && echo "  Mirror(s) at fault: ${_bad}(currently: ${DEVUAN_MIRROR})"
-        echo ""
-        echo "  Rebuild using a specific mirror instead:"
-        echo ""
-        echo "    DEVUAN_MIRROR=http://ftp.fau.de/devuan/merged $0"
-        echo ""
-        echo "  ══════════════════════════════════════════════════════════"
-    fi
-    _die "live-build failed. Check ${LB_LOG}"
+ATTEMPTS_LOG="${BUILD_DIR}/lb-build-attempts.log"
+: > "$ATTEMPTS_LOG"
+
+# Retry the *actual lb build* invocation, which invokes lb bootstrap internally.
+# An earlier version only retried a separate 'lb bootstrap' call, leaving the
+# subsequent 'lb build' free to fail at the same download step without retrying.
+# The raw final attempt goes in lb-build.log; every attempt and chosen mirror
+# is retained in lb-build-attempts.log for diagnostics.
+#
+# Default: Devuan's recommended official endpoint, then two independently
+# hosted package mirrors. The independent hosts have their own /merged trees;
+# this is not an ISO/CD-image mirror. Do not mix in Debian package repositories.
+# Custom DEVUAN_MIRROR values are honoured and retried once without override.
+BOOTSTRAP_MIRRORS=("$DEVUAN_MIRROR" "$DEVUAN_MIRROR")
+if [[ "${DEVUAN_MIRROR%/}" == 'http://deb.devuan.org/merged' ]]; then
+    BOOTSTRAP_MIRRORS=(
+        'http://deb.devuan.org/merged'
+        'https://ftp.fau.de/devuan/merged'
+        'https://ftp.fau.de/devuan/merged'
+        'https://mirror.mirohost.net/devuan/merged'
+    )
 fi
+
+# Update the live-build configs for every stage, not just bootstrap. The
+# source and binary stages must use the same package source as the chroot.
+_switch_live_build_mirror() {
+    local old="$1" new="$2" cfg contents
+    [[ "$old" == "$new" ]] && return 0
+    for cfg in config/common config/bootstrap config/chroot config/binary config/source; do
+        [[ -f "$cfg" ]] || continue
+        contents="$(< "$cfg")"
+        contents="${contents//"$old"/"$new"}"
+        printf '%s\n' "$contents" > "$cfg"
+    done
+    DEVUAN_MIRROR="$new"
+}
+
+_build_succeeded=0
+for (( _try=0; _try<${#BOOTSTRAP_MIRRORS[@]}; _try++ )); do
+    _mirror="${BOOTSTRAP_MIRRORS[$_try]}"
+    if (( _try > 0 )); then
+        _info "Cleaning partial build before changing mirrors..."
+        # --purge removes partial caches/state but retains config/, hooks,
+        # package lists and installer assets created earlier in this script.
+        if ! lb clean --purge >> "$ATTEMPTS_LOG" 2>&1; then
+            _die "Cannot clean failed build. See $ATTEMPTS_LOG"
+        fi
+        _switch_live_build_mirror "$DEVUAN_MIRROR" "$_mirror"
+    fi
+    printf '\n==== Build attempt %s/%s | mirror: %s ====\n' \
+        "$((_try + 1))" "${#BOOTSTRAP_MIRRORS[@]}" "$_mirror" | tee -a "$ATTEMPTS_LOG"
+    _info "Using Devuan mirror: $_mirror"
+    _info "Running live-build attempt $((_try + 1))/${#BOOTSTRAP_MIRRORS[@]}"
+
+    # Do not use 'lb bootstrap' here: run the command that really generates
+    # the ISO, and check its exit status independently of tee's status.
+    set +e
+    lb build 2>&1 | tee "$LB_LOG" | while IFS= read -r line; do
+        echo "  ${line}"
+    done
+    _build_rc=${PIPESTATUS[0]}
+    set -e
+    {
+        printf '\n==== Attempt %s | mirror: %s | exit: %s ====\n' \
+            "$((_try + 1))" "$_mirror" "$_build_rc"
+        cat "$LB_LOG"
+    } >> "$ATTEMPTS_LOG"
+
+    if (( _build_rc == 0 )) && ! grep -qE '^E:|^lb build failed|efi: ERROR' "$LB_LOG"; then
+        _build_succeeded=1
+        _ok "ISO build completed using $_mirror"
+        break
+    fi
+
+    # Only automatically repeat if we know the failure was in debootstrap's
+    # network download step. Re-running after a failed hook could repeat a
+    # large build and conceal an unrelated defect.
+    if ! grep -Eqi "couldn.t download (package|packages)|failed to fetch|unable to fetch|mirror sync in progress|temporary failure resolving|connection (failed|timed out)|network is unreachable|404 not found" "$LB_LOG" \
+       || ! grep -Eq 'lb bootstrap|lb bootstrap_debootstrap|Running debootstrap' "$LB_LOG" \
+       || grep -q 'P: Bootstrap stage completed' "$LB_LOG"; then
+        _die "live-build failed outside the bootstrap download stage. Check $LB_LOG and $ATTEMPTS_LOG"
+    fi
+
+    # Give a useful upstream HTTP response when debootstrap's default output
+    # suppresses the reason an individual .deb failed. A failed probe is
+    # diagnostics only; it cannot make the build succeed or be marked valid.
+    _failed_url="$(grep -m1 -Eo 'https?://[^[:space:]]+\.deb' "$LB_LOG" || true)"
+    if [[ -n "$_failed_url" ]] && command -v wget >/dev/null 2>&1; then
+        {
+            printf '\nChecking failed package URL: %s\n' "$_failed_url"
+            wget --spider -S --timeout=10 --tries=1 "$_failed_url" 2>&1 | tail -15 || true
+        } >> "$ATTEMPTS_LOG"
+    fi
+    _info "Devuan base package download failed; mirror recovery will try another attempt."
+done
+
+if (( !_build_succeeded )); then
+    _die "Devuan package downloads failed on every attempted mirror. See $ATTEMPTS_LOG (all attempts) and $LB_LOG (last attempt)."
+fi
+
 # Also verify the ISO was actually produced
 if [[ ! -f "${BUILD_DIR}/live-image-amd64.hybrid.iso" ]] &&    ! find "${BUILD_DIR}" -name "*.iso" | grep -q .; then
     _die "live-build produced no ISO. Check ${LB_LOG}"
+fi
+
+# Verify both 32-bit UEFI entry points before calling this build successful.
+# In particular, EFI/BOOT on the ISO is not what dd-written media loads;
+# they read BOOTIA32.EFI from the embedded FAT boot image instead.
+_step "Verifying 32-bit UEFI boot files"
+EFI_TREE_FILE=$(find "${BUILD_DIR}/binary/EFI" -type f -iname bootia32.efi -print -quit 2>/dev/null)
+[[ -n "$EFI_TREE_FILE" && -s "$EFI_TREE_FILE" ]] || \
+    _die "32-bit UEFI loader missing from ISO filesystem (EFI/BOOT)."
+EFI_IMG="${BUILD_DIR}/binary/boot/grub/efi.img"
+[[ -s "$EFI_IMG" ]] || _die "EFI boot image missing — dd-written media will not boot."
+if ! mdir -i "$EFI_IMG" ::/EFI/BOOT/BOOTIA32.EFI >/dev/null 2>&1; then
+    _die "32-bit UEFI loader is absent from the embedded EFI boot partition."
+fi
+if ! mdir -i "$EFI_IMG" ::/EFI/BOOT/BOOTX64.EFI >/dev/null 2>&1; then
+    _die "Rebuilding embedded EFI image lost the 64-bit UEFI loader."
+fi
+# Presence alone is insufficient: a stale live-build IA32 loader can remain
+# inside efi.img if the replacement silently failed. Compare the file bytes.
+EFI_VERIFY_TMP=$(mktemp -d)
+if ! mcopy -o -i "$EFI_IMG" ::/EFI/BOOT/BOOTIA32.EFI "$EFI_VERIFY_TMP/bootia32.efi" >/dev/null 2>&1; then
+    rm -rf "$EFI_VERIFY_TMP"
+    _die "Cannot read BOOTIA32.EFI from the embedded EFI image."
+fi
+if ! cmp -s "$EFI_TREE_FILE" "$EFI_VERIFY_TMP/bootia32.efi"; then
+    rm -rf "$EFI_VERIFY_TMP"
+    _die "BOOTIA32.EFI inside efi.img differs from the GRUB loader in the ISO tree."
+fi
+rm -rf "$EFI_VERIFY_TMP"
+_ok "IA32 GRUB matches in ISO tree and embedded EFI image."
+EFI_STAGE_EXPECTED="$EFI_TREE_FILE"
+
+# Visor checks include large files copied back from FAT32. Announce them
+# before the first mcopy, otherwise the builder looks idle for minutes.
+_step "Verifying 64-bit UEFI Visor boot files"
+_info "Checking the x64 EFI loader, boot.conf, kernel and initrd in the FAT32 image."
+_info "Large initrd extraction can take several minutes; progress will appear every 15 seconds."
+
+# x64 Visor remains the default on extracted FAT USB media.
+# x64 is intentionally NOT changed to GRUB-first: on extracted FAT USB,
+# BOOTX64.EFI must be Visor. Confirm it is the actual Visor executable.
+# On raw/DD USB media the embedded FAT contains Visor plus its kernel,
+# initrd and GRUB fallback. The firmware
+# selects IA32 GRUB or the x64 loader using the EFI executable filename.
+EFI_VISOR_PAYLOAD="${BUILD_DIR}/binary/EFI/visor/visor_x64.efi"
+EFI_X64_TREE_FILE=$(find "${BUILD_DIR}/binary/EFI" -type f -iname bootx64.efi -print -quit 2>/dev/null)
+if [[ -s "$EFI_VISOR_PAYLOAD" ]]; then
+    [[ -n "$EFI_X64_TREE_FILE" && -s "$EFI_X64_TREE_FILE" ]] || \
+        _die "Visor exists but BOOTX64.EFI is missing from the ISO tree."
+    cmp -s "$EFI_VISOR_PAYLOAD" "$EFI_X64_TREE_FILE" || \
+        _die "x64 BOOTX64.EFI does not match Visor; the wrong 64-bit boot menu would load."
+    # Also verify the raw/DD boot FAT contains the same Visor EFI binary.
+    VISOR_FAT_TMP=$(mktemp -d)
+    VISOR_FAT_COPY="${VISOR_FAT_TMP}/BOOTX64.EFI"
+    _info "Extracting BOOTX64.EFI (Visor) from the FAT32 image..."
+    if ! _monitored_cmd "Reading Visor EFI loader" \
+         mcopy -o -i "$EFI_IMG" ::/EFI/BOOT/BOOTX64.EFI "$VISOR_FAT_COPY"; then
+        rm -rf "$VISOR_FAT_TMP"
+        _die "Could not extract x64 loader from embedded FAT32 image (see the error above)."
+    fi
+    if ! cmp -s "$VISOR_FAT_COPY" "$EFI_VISOR_PAYLOAD"; then
+        _info "Mismatch: expected Visor and embedded BOOTX64.EFI have different hashes:"
+        sha256sum "$EFI_VISOR_PAYLOAD" "$VISOR_FAT_COPY" || true
+        if [[ -s "${BUILD_DIR}/binary/EFI/BOOT/grubx64-alternix.efi" ]] && \
+           cmp -s "$VISOR_FAT_COPY" "${BUILD_DIR}/binary/EFI/BOOT/grubx64-alternix.efi"; then
+            _info "Embedded BOOTX64.EFI is the original GRUB loader, not Visor."
+        fi
+        rm -rf "$VISOR_FAT_TMP"
+        _die "Extracted x64 loader does not match the expected Visor EFI executable."
+    fi
+    rm -rf "$VISOR_FAT_TMP"
+    _ok "BOOTX64.EFI matches the Visor executable."
+    for boot_file in EFI/visor/boot.conf EFI/BOOT/grubx64-alternix.efi live/vmlinuz live/initrd.img; do
+        if ! mdir -i "$EFI_IMG" "::/$boot_file" >/dev/null 2>&1; then
+            _die "Embedded FAT boot image is missing $boot_file for x64 Visor."
+        fi
+    done
+    # Presence is not enough: compare the config and large payload files.
+    # A partial FAT copy must not produce an allegedly bootable ISO.
+    for entry in         "EFI/visor/boot.conf|${BUILD_DIR}/binary/EFI/visor/boot.conf"         "live/vmlinuz|${BUILD_DIR}/binary/live/vmlinuz"         "live/initrd.img|${BUILD_DIR}/binary/live/initrd.img"; do
+        boot_file=${entry%%|*}
+        expected=${entry#*|}
+        if [[ ! -s "$expected" ]]; then
+            # live-build writes versioned kernel/initrd files and the
+            # 9999-fix-grub-kernel hook may not have created the aliases.
+            for candidate in "$expected"-*; do
+                [[ -s "$candidate" ]] && expected="$candidate"
+            done
+        fi
+        [[ -s "$expected" ]] || _die "Missing expected ISO file for $boot_file"
+        _info "Checking $boot_file ($(du -h "$expected" | cut -f1) expected)..."
+        compare_tmp=$(mktemp -d)
+        copied="${compare_tmp}/$(basename "$boot_file")"
+        if ! _monitored_cmd "Reading $boot_file from FAT32" \
+             mcopy -o -i "$EFI_IMG" "::/$boot_file" "$copied"; then
+            rm -rf "$compare_tmp"
+            _die "Cannot extract $boot_file from embedded FAT32 image (see the error above)."
+        fi
+        if ! _monitored_cmd "Byte-comparing $boot_file" cmp -s "$copied" "$expected"; then
+            rm -rf "$compare_tmp"
+            _die "Extracted $boot_file differs from the ISO filesystem."
+        fi
+        rm -rf "$compare_tmp"
+        _ok "$boot_file matches the ISO filesystem."
+    done
+    _ok "64-bit UEFI: Visor, configuration, kernel and initrd verified in embedded FAT boot image."
+else
+    _info "WARNING: Visor build unavailable; x64 UEFI uses live-build GRUB fallback."
+fi
+
+# The ISO is amd64 even on an IA32 UEFI tablet. This requires kernel EFI
+# mixed-mode support plus the handover entry used by i386-efi GRUB. Report
+# incompatibility instead of mistaking a compiled GRUB binary for proof of boot.
+_step "Checking 32-bit firmware / 64-bit kernel compatibility"
+KCONFIG=$(find "${BUILD_DIR}/chroot/boot" -maxdepth 1 -name 'config-*' 2>/dev/null | sort -V | tail -1)
+if [[ -n "$KCONFIG" && -f "$KCONFIG" ]]; then
+    if grep -qx 'CONFIG_EFI_MIXED=y' "$KCONFIG" && \
+       grep -qx 'CONFIG_EFI_HANDOVER_PROTOCOL=y' "$KCONFIG"; then
+        _ok "Kernel supports 32-bit EFI firmware booting an amd64 kernel."
+    else
+        _info "WARNING: $KCONFIG lacks CONFIG_EFI_MIXED=y or EFI handover."
+        _info "GRUB IA32 menu may open, but the 64-bit kernel may not start."
+    fi
+else
+    _info "Kernel config not found; cannot verify EFI mixed-mode capability."
 fi
 
 # Post-build safety net: verify unversioned kernel exists in the binary tree
@@ -1243,20 +1949,63 @@ if [[ -d "$BIN_LIVE" ]] && [[ ! -f "${BIN_LIVE}/vmlinuz" ]]; then
     fi
 fi
 
-# Post-process ISO for Rufus/Windows compatibility
-_step "Making ISO Rufus-compatible"
-FOUND_ISO_TEMP=$(find "${BUILD_DIR}" -name "*.iso" 2>/dev/null | head -1)
-if [[ -n "$FOUND_ISO_TEMP" ]]; then
-    if command -v isohybrid &>/dev/null; then
-        isohybrid --uefi "$FOUND_ISO_TEMP" 2>/dev/null || \
-            isohybrid "$FOUND_ISO_TEMP" 2>/dev/null || true
-        _ok "isohybrid applied — Rufus compatible."
-    else
-        _info "isohybrid not found. Installing syslinux-utils..."
-        apt-get install -y syslinux-utils &>/dev/null && \
-            isohybrid --uefi "$FOUND_ISO_TEMP" 2>/dev/null || true
-    fi
+# live-build's iso-hybrid image is already hybrid. DO NOT pass it to
+# syslinux isohybrid again: that tool rewrites the image system area and
+# partition data, potentially changing the EFI metadata used by tablets.
+_step "Preserving live-build EFI boot metadata"
+_info "Keeping live-build's xorriso hybrid partition tables unchanged."
+FOUND_ISO_TEMP=$(find "${BUILD_DIR}" -maxdepth 1 -name "*.iso" -print -quit)
+[[ -s "$FOUND_ISO_TEMP" ]] || _die "No ISO found for boot metadata verification."
+if ! xorriso -indev "$FOUND_ISO_TEMP" -report_el_torito plain -report_system_area plain \
+       > "${BUILD_DIR}/iso-boot-report.txt" 2>&1; then
+    _die "xorriso cannot read the generated ISO's boot metadata."
 fi
+if ! grep -Eq 'El Torito boot img.*UEFI' "${BUILD_DIR}/iso-boot-report.txt"; then
+    _die "Generated ISO has no El Torito UEFI boot image. Check iso-boot-report.txt."
+fi
+# Validate the FINISHED ISO, not just live-build's intermediate binary/
+# directory. A rebuilt efi.img in binary/ is irrelevant if the final ISO
+# retained the old FAT image. Check the final ISO's boot image byte-for-byte
+# and the IA32 executable inside it; also verify the file-copied USB path.
+EFI_CHECK_TMP=$(mktemp -d)
+if ! xorriso -osirrox on -indev "$FOUND_ISO_TEMP" \
+       -extract /boot/grub/efi.img "$EFI_CHECK_TMP/efi.img" >/dev/null 2>&1; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Finished ISO lacks the embedded EFI boot image."
+fi
+if ! cmp -s "$EFI_CHECK_TMP/efi.img" "$EFI_IMG"; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Finished ISO embeds a stale EFI image; IA32 boot would fail on DD-written USB."
+fi
+if [[ "$(dd if="$EFI_CHECK_TMP/efi.img" bs=1 skip=82 count=8 2>/dev/null)" != 'FAT32   ' ]]; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Finished ISO's embedded EFI image is not FAT32."
+fi
+if ! mdir -i "$EFI_CHECK_TMP/efi.img" ::/EFI/BOOT/BOOTX64.EFI >/dev/null 2>&1; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Finished ISO's embedded EFI image lost the x64 loader."
+fi
+if ! mcopy -o -i "$EFI_CHECK_TMP/efi.img" ::/EFI/BOOT/BOOTIA32.EFI \
+        "$EFI_CHECK_TMP/from-fat32.efi" >/dev/null 2>&1; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Finished ISO's embedded FAT32 image has no IA32 GRUB loader."
+fi
+if ! xorriso -osirrox on -indev "$FOUND_ISO_TEMP" \
+       -extract /EFI/BOOT/BOOTIA32.EFI \
+       "$EFI_CHECK_TMP/from-iso.efi" >/dev/null 2>&1; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Finished ISO has no EFI/BOOT/BOOTIA32.EFI for FAT32-extracted USB media."
+fi
+if ! cmp -s "$EFI_CHECK_TMP/from-fat32.efi" "$EFI_STAGE_EXPECTED"; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Final FAT32 IA32 GRUB does not match generated loader."
+fi
+if ! cmp -s "$EFI_CHECK_TMP/from-iso.efi" "$EFI_STAGE_EXPECTED"; then
+    rm -rf "$EFI_CHECK_TMP"
+    _die "Final ISO filesystem IA32 GRUB does not match generated loader."
+fi
+rm -rf "$EFI_CHECK_TMP"
+_ok "Final ISO: IA32 GRUB matches in ISO filesystem and embedded FAT32 ESP."
 
 # ── Copy output ───────────────────────────────────────────────────
 _step "Finalising"
@@ -1270,7 +2019,11 @@ if [[ -z "$FOUND_ISO" ]]; then
     _die "ISO not found in build output."
 fi
 
-cp "$FOUND_ISO" "$OUTPUT_ISO"
+_info "Writing finished ISO ($(du -h "$FOUND_ISO" | cut -f1)) to ${OUTPUT_ISO}..."
+if ! _monitored_cmd "Copying final ISO" cp --reflink=auto "$FOUND_ISO" "$OUTPUT_ISO"; then
+    _die "Failed to copy finished ISO to ${OUTPUT_ISO}. Check available disk space."
+fi
+[[ -s "$OUTPUT_ISO" ]] || _die "Output ISO is empty after copying."
 _ok "ISO written: ${OUTPUT_ISO}"
 
 SIZE=$(du -sh "$OUTPUT_ISO" | cut -f1)
@@ -1280,6 +2033,9 @@ echo "  Alternix Installer ISO built successfully"
 echo "  Output: ${OUTPUT_ISO}"
 echo "  Size:   ${SIZE}"
 echo "  ══════════════════════════════════════════"
+echo ""
+echo "  Boot defaults: 64-bit UEFI -> Visor, 32-bit UEFI -> GRUB text menu."
+echo "  IA32 GRUB is included automatically in both boot layouts."
 echo ""
 echo "  Write to USB:"
 echo "    sudo dd if=${OUTPUT_ISO} of=/dev/sdX bs=4M status=progress"

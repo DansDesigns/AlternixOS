@@ -406,17 +406,20 @@ _configure_fstab() {
 
     local root_uuid
     root_uuid=$(blkid -s UUID -o value "$PART_ROOT")
+    [[ -n "$root_uuid" ]] || die "Cannot determine root UUID for $PART_ROOT"
     echo "UUID=${root_uuid}  /  ext4  errors=remount-ro  0  1" >> "$fstab"
 
     if [[ -n "$PART_BOOT" ]]; then
         local boot_uuid
         boot_uuid=$(blkid -s UUID -o value "$PART_BOOT")
+        [[ -n "$boot_uuid" ]] || die "Cannot determine /boot UUID for $PART_BOOT"
         echo "UUID=${boot_uuid}  /boot  ext4  defaults  0  2" >> "$fstab"
     fi
 
     if [[ -n "$PART_EFI" ]]; then
         local efi_uuid
         efi_uuid=$(blkid -s UUID -o value "$PART_EFI")
+        [[ -n "$efi_uuid" ]] || die "Cannot determine EFI UUID for $PART_EFI"
         echo "UUID=${efi_uuid}  /boot/efi  vfat  umask=0077  0  1" >> "$fstab"
     fi
 
