@@ -74,17 +74,22 @@ banner() {
     echo -e "  ${W}Alternix Installer v0.1${N}  ${D}One OS. Any machine.${N}"
     echo ""
     echo -e "  ${D}CPU   ${N}${W}${cpu}${N}"
-    # Battery meter (laptops) — blank on desktops
-    local bat_cap bat_stat bat_str=""
-    bat_cap=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | sed -n 1p)
-    bat_stat=$(cat /sys/class/power_supply/BAT*/status 2>/dev/null | sed -n 1p)
-    if [[ -n "$bat_cap" ]]; then
-        local bat_col="$G"
-        (( bat_cap < 50 )) && bat_col="$Y"
-        (( bat_cap < 20 )) && bat_col="$R"
-        local bat_sym="▮"
-        [[ "$bat_stat" == "Charging" ]] && bat_sym="⚡"
-        bat_str="   ${D}Batt${N} ${bat_col}${bat_sym}${bat_cap}%${N}"
+    # Battery meter: use sysfs type, not BAT* (tablet names vary).
+    local bat_str="" bat_cap bat_stat bat_col bat_sym
+    _scan_power_supplies
+    bat_cap=$HW_BATTERY_PCT
+    bat_stat=$HW_BATTERY_STATUS
+    if (( HW_BATTERY_FOUND )); then
+        if [[ -n "$bat_cap" ]]; then
+            bat_col="$G"
+            (( bat_cap < 50 )) && bat_col="$Y"
+            (( bat_cap < 20 )) && bat_col="$R"
+            bat_sym="▮"
+            [[ "${bat_stat,,}" == charging ]] && bat_sym="⚡"
+            bat_str="   ${D}Batt${N} ${bat_col}${bat_sym}${bat_cap}%${N}"
+        else
+            bat_str="   ${D}Batt${N} ${Y}unknown${N}"
+        fi
     fi
     echo -e "  ${D}RAM   ${N}${W}${ram}${N}   ${D}Arch${N} ${W}${arch}${N}${bat_str}"
     local _ec=${ALTERNIX_ERROR_COUNT:-0}

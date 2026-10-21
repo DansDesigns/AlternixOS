@@ -260,6 +260,19 @@ _configure_user() {
         warn "Shadow entry differs from generated hash — verify login after boot."
     fi
 
+    # The live ISO auto-logs in as root. The copy installer strips that
+    # live-only getty, including the original tty1 entry it had replaced.
+    # Restore tty1 for the installed user so the prebuilt .bash_profile
+    # can launch Qtile on first boot rather than leaving a blank console.
+    if [[ "${ALTERNIX_COPY_INSTALL:-0}" -eq 1 &&
+          "${ALTERNIX_DESKTOP:-}" == "alternix" &&
+          -f "${ALTERNIX_MOUNT}/etc/inittab" ]]; then
+        sed -i -E '/^#?1:[^:]*:[^:]*:.*tty1/d' "${ALTERNIX_MOUNT}/etc/inittab"
+        printf '1:2345:respawn:/sbin/agetty --autologin %s --noclear tty1 linux\n' \
+            "${ALTERNIX_USERNAME}" >> "${ALTERNIX_MOUNT}/etc/inittab"
+        ok "tty1 autologin configured for ${ALTERNIX_USERNAME}."
+    fi
+
     ok "User ${ALTERNIX_USERNAME} ready."
 }
 
@@ -387,8 +400,12 @@ require dhcp_server_identifier
 slaac private
 EOF
 
-    # Keep the installed system's clock correct (broken RTCs like Miix 520)
-    _chroot "apt-get install -y ntpsec-ntpdate" 2>>"$ALTERNIX_LOG" ||         _chroot "apt-get install -y ntpdate" 2>>"$ALTERNIX_LOG" || true
+    # The baked image has its packages already. Downloading an optional
+    # time-sync helper during disk installation would delay tablets on Wi-Fi.
+    if [[ "${ALTERNIX_PREBUILT_INSTALL:-0}" -ne 1 ]]; then
+        _chroot "apt-get install -y ntpsec-ntpdate" 2>>"$ALTERNIX_LOG" || \
+            _chroot "apt-get install -y ntpdate" 2>>"$ALTERNIX_LOG" || true
+    fi
     hwclock --systohc 2>/dev/null || true
 
     # SERVICE ENABLE/DISABLE — see _svc_enable/_svc_disable near _chroot()
@@ -453,7 +470,26 @@ EOF
 _install_extra_packages() {
     section "Installing Extra Packages"
 
-    info "Installing nala, fastfetch, wifi tools..."
+    # For an image-based install, the complete app stack and NetworkManager
+    # were already installed at ISO build time. Re-running apt-get update and
+    # fetching packages here can take several minutes on tablet Wi-Fi and is
+    # unnecessary. Let users update packages after their first boot.
+    if [[ "${ALTERNIX_PREBUILT_INSTALL:-0}" -eq 1 ]]; then
+        info "Using the packages already bundled in the ISO (no target downloads)."
+        _svc_enable "network-manager"
+        # Preserve the Wi-Fi CLI script normally created at the end of
+        # this function even when its online APT portion is skipped.
+        _write_wifi_tui
+        # delive_target deliberately diverts invoke-rc.d while purging
+        # live-boot. It MUST be restored before booting the target.
+        rm -f "${ALTERNIX_MOUNT}/usr/sbin/invoke-rc.d"
+        chroot "$ALTERNIX_MOUNT" dpkg-divert --local --rename --quiet \
+            --remove /usr/sbin/invoke-rc.d 2>/dev/null || true
+        rm -f "${ALTERNIX_MOUNT}/usr/sbin/policy-rc.d"
+        return 0
+    fi
+
+    info "Installing fastfetch and Wi-Fi tools with APT..."
 
     # Bind mounts for chroot network access
     # (bind of /dev is NOT recursive — /dev/pts needs its own bind,
@@ -477,10 +513,6 @@ _install_extra_packages() {
     if [[ ${PIPESTATUS[0]} -eq 124 ]]; then
         warn "apt-get update timed out after 5 minutes; continuing with existing lists."
     fi
-
-    # Install nala (better apt frontend)
-    _chroot "apt-get install -y nala" 2>&1 | tee -a "$ALTERNIX_LOG" || \
-        warn "nala not available — using apt."
 
     # Install fastfetch
     _chroot "apt-get install -y fastfetch" 2>&1 | tee -a "$ALTERNIX_LOG" || \

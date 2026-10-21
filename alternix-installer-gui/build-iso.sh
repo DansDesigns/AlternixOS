@@ -30,6 +30,7 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 # always uses deb.devuan.org, so pinning here never reaches a user.
 DEVUAN_MIRROR="${DEVUAN_MIRROR:-http://deb.devuan.org/merged}"
 OUTPUT_ISO="${SCRIPT_DIR}/alternix-installer.iso"
+ALTERNIX_BUILD_MODE="" # chosen interactively, or read from the completed image for finalisation
 
 # ── Colours (minimal, build-time only) ───────────────────────────
 _info()  { echo "  · $*"; }
@@ -81,8 +82,368 @@ _monitored_cmd() {  # label command args...
     fi
 }
 
+# ── FAT32-sized live rootfs layers ───────────────────────────────────
+# FAT32 can store a 4-GiB-less-one-byte file, not a 5+ GiB squashfs.
+# Split the *finished* live-build squashfs into genuine mountable layers,
+# then replay the ISO's hybrid BIOS/UEFI boot configuration. This keeps
+# Rufus ISO-mode FAT32 support without changing the desktop contents.
+# Live-boot overlays these in filesystem.module order; install_copy.sh
+# unpacks the same ordered images to install the exact complete system.
+_fat32_repack_squashfs() {
+    local live_dir="$BUILD_DIR/binary/live"
+    local source_img="$live_dir/filesystem.squashfs"
+    local original_iso="$BUILD_DIR/live-image-amd64.hybrid.iso"
+    local max_fat=4294967295
+    # Cap *uncompressed apparent* bytes per layer well below FAT32 max.
+    # Even incompressible files leave ample room for SquashFS metadata.
+    local max_layer_bytes=2684354560
+    local temp="$BUILD_DIR/.alternix-squashfs-split"
+    local extracted="$temp/extracted" stages="$temp/stages"
+    local whole="$temp/whole.squashfs"
+    local original_size name num=0 current_bytes=0
+    local item_size rel target stage stage_num file cpu_count
+    local rebuilt="$BUILD_DIR/.alternix-fat32-repacked.iso"
+    local -a layer_images=() xorriso_args=() children=()
+
+    [[ -s "$source_img" ]] || _die "Missing finished live root filesystem."
+    original_size=$(stat -c %s "$source_img")
+    if (( original_size <= max_fat )); then
+        _ok "Single squashfs fits FAT32 ($(du -h "$source_img" | cut -f1))."
+        return 0
+    fi
+    [[ -s "$original_iso" ]] || _die "Missing completed hybrid ISO for FAT32 repacking."
+    [[ ! -e "$temp" ]] || _die "Stale $temp exists. Remove it after checking free space, then retry."
+    command -v mksquashfs >/dev/null || _die "mksquashfs required for large FAT32 images."
+    command -v unsquashfs >/dev/null || _die "unsquashfs required for large FAT32 images."
+    command -v xorriso >/dev/null || _die "xorriso required to preserve the ISO hybrid boot layout."
+
+    _step "Packing large live desktop into FAT32-safe SquashFS layers"
+    _info "Full squashfs is $(du -h "$source_img" | cut -f1); installed packages will not be removed."
+    _info "This operation needs extra temporary disk space for the unpacked rootfs."
+    mkdir -p "$extracted" "$stages"
+    # Work from the exact completed SquashFS, not the mutable build chroot.
+    # The root user's xattrs, symlinks, hardlinks, devices and all installed
+    # desktop files are thereby preserved from the bootable source image.
+    if ! unsquashfs -no-progress -d "$extracted" "$source_img" >"$temp/unpack.log" 2>&1; then
+        tail -25 "$temp/unpack.log" >&2 || true
+        _die "Could not extract the original SquashFS for FAT32 layering."
+    fi
+    if [[ "$ALTERNIX_BUILD_MODE" == "live-preview" ]]; then
+        [[ -s "$extracted/etc/alternix/de-baked" ]] || \
+            _die "Refusing to split a live-preview image without the prebuilt AlternixDE marker."
+    fi
+
+    # Partition the extracted filesystem by whole paths. Large directories
+    # are partitioned recursively; a layer never exceeds 2.5 GiB of raw
+    # apparent data. cp --link avoids storing duplicate copies of the
+    # 11+ GiB rootfs when creating layer staging trees on the same disk.
+    _fat32_add_item() {
+        local item="$1" bytes="$2" new_layer
+        if (( num == 0 || current_bytes + bytes > max_layer_bytes )); then
+            num=$((num + 1))
+            current_bytes=0
+            new_layer="$stages/$(printf '%02d' "$num")"
+            mkdir -p "$new_layer"
+        fi
+        target="$stages/$(printf '%02d' "$num")"
+        ( cd "$extracted" && cp -a --link --parents -- "$item" "$target/" ) || \
+            _die "Could not stage $item for SquashFS layer $num."
+        current_bytes=$((current_bytes + bytes))
+    }
+    _fat32_partition_dir() {
+        local path="$1" bytes="$2" child child_bytes
+        local -a entries=()
+        if (( bytes <= max_layer_bytes )); then
+            _fat32_add_item "$path" "$bytes"
+            return 0
+        fi
+        [[ -d "$extracted/$path" && ! -L "$extracted/$path" ]] || \
+            _die "A single file exceeds the safe FAT32 SquashFS layer limit: $path"
+        mapfile -d '' -t entries < <(find "$extracted/$path" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+        (( ${#entries[@]} > 0 )) || _die "Cannot partition oversized empty directory: $path"
+        for child in "${entries[@]}"; do
+            child="${child#"$extracted/"}"
+            child_bytes=$(du -sb --apparent-size -- "$extracted/$child" | cut -f1) || \
+                _die "Cannot measure $child"
+            _fat32_partition_dir "$child" "$child_bytes"
+        done
+    }
+
+    mapfile -d '' -t children < <(find "$extracted" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+    for rel in "${children[@]}"; do
+        rel="${rel#"$extracted/"}"
+        item_size=$(du -sb --apparent-size -- "$extracted/$rel" | cut -f1) || _die "Cannot measure $rel"
+        _fat32_partition_dir "$rel" "$item_size"
+    done
+    (( num >= 2 )) || _die "Rootfs splitting did not create at least two layers."
+
+    # The original ISO and binary/ tree remain intact until *every* layer
+    # has been built and validated. The manifest controls overlay ordering.
+    cpu_count=$(nproc 2>/dev/null || echo 2)
+    (( cpu_count > 8 )) && cpu_count=8
+    for ((stage_num=1; stage_num<=num; stage_num++)); do
+        if (( stage_num == 1 )); then name="filesystem.squashfs";
+        else name="filesystem-$(printf '%02d' "$stage_num").squashfs"; fi
+        file="$temp/$name"
+        stage="$stages/$(printf '%02d' "$stage_num")"
+        _info "Compressing live layer $stage_num/$num ($name)..."
+        if ! mksquashfs "$stage" "$file" -noappend -comp "$LB_COMPRESSION_CHOICE" \
+                -b 131072 -processors "$cpu_count" -no-progress >"$temp/pack-$stage_num.log" 2>&1; then
+            tail -25 "$temp/pack-$stage_num.log" >&2 || true
+            _die "Could not create $name."
+        fi
+        [[ -s "$file" ]] || _die "Empty squashfs layer: $name"
+        (( $(stat -c %s "$file") <= max_fat )) || \
+            _die "$name still exceeds FAT32 size cap."
+        unsquashfs -s "$file" >/dev/null 2>&1 || _die "Invalid squashfs layer $name"
+        layer_images+=("$file")
+        _ok "$name: $(du -h "$file" | cut -f1)"
+    done
+
+    # Build the module manifest before rewriting the ISO. Keep the first
+    # layer named filesystem.squashfs, matching old installer discovery.
+    : > "$temp/filesystem.module"
+    for file in "${layer_images[@]}"; do
+        printf '%s\n' "${file##*/}" >> "$temp/filesystem.module"
+    done
+    # Build checksums for the modified ISO contents, when live-build has
+    # generated a checksum manifest. Leave unrelated checksums unchanged.
+    if [[ -f "$BUILD_DIR/binary/md5sum.txt" ]]; then
+        grep -Ev '[[:space:]]+\*?\.?/?live/filesystem(-[0-9]+)?\.squashfs$|[[:space:]]+\*?\.?/?live/filesystem\.module$' \
+            "$BUILD_DIR/binary/md5sum.txt" >"$temp/md5sum.txt" || true
+        for file in "${layer_images[@]}"; do
+            printf '%s  live/%s\n' "$(md5sum "$file" | cut -d' ' -f1)" "${file##*/}" >>"$temp/md5sum.txt"
+        done
+        printf '%s  live/filesystem.module\n' "$(md5sum "$temp/filesystem.module" | cut -d' ' -f1)" >>"$temp/md5sum.txt"
+    fi
+
+    # xorriso replays El Torito + isohybrid MBR/GPT, preserving the same
+    # original x64 Visor, IA32 GRUB, BIOS loader, and embedded FAT32 ESP.
+    # In particular DO NOT regenerate ISO with plain mkisofs here.
+    xorriso_args=(-indev "$original_iso" -outdev "$rebuilt" \
+                  -rm /live/filesystem.squashfs --)
+    for file in "${layer_images[@]}"; do
+        xorriso_args+=(-map "$file" "/live/${file##*/}")
+    done
+    xorriso_args+=(-map "$temp/filesystem.module" /live/filesystem.module)
+    if [[ -f "$temp/md5sum.txt" ]]; then
+        xorriso_args+=(-map "$temp/md5sum.txt" /md5sum.txt)
+    fi
+    xorriso_args+=(-boot_image any replay -compliance no_emul_toc -padding included)
+    _info "Rebuilding the existing hybrid ISO with mountable FAT32-sized layers..."
+    if ! xorriso "${xorriso_args[@]}" >"$temp/xorriso.log" 2>&1; then
+        tail -35 "$temp/xorriso.log" >&2 || true
+        _die "Hybrid ISO repack failed; original bootable ISO has not been overwritten."
+    fi
+    [[ -s "$rebuilt" ]] || _die "Repacked ISO was not created."
+    if ! xorriso -indev "$rebuilt" -report_el_torito plain -report_system_area plain \
+            >"$temp/boot-report.log" 2>&1; then
+        _die "Repacked ISO has unreadable boot records."
+    fi
+    grep -Eq 'El Torito boot img.*UEFI' "$temp/boot-report.log" || \
+        _die "Repacked ISO lost its UEFI boot record."
+    if ! xorriso -osirrox on -indev "$rebuilt" \
+            -extract /live/filesystem.module "$temp/iso-filesystem.module" \
+            >"$temp/manifest-read.log" 2>&1; then
+        _die "Repacked ISO is missing the ordered SquashFS layer manifest."
+    fi
+    cmp -s "$temp/filesystem.module" "$temp/iso-filesystem.module" || \
+        _die "Repacked ISO has a different SquashFS layer manifest."
+    # Once ISO boot structure is valid, publish all its corresponding
+    # images and manifest into live-build's binary tree.
+    mv "$original_iso" "$temp/original.iso"
+    mv "$rebuilt" "$original_iso"
+    mv "$source_img" "$whole"
+    for file in "${layer_images[@]}"; do
+        mv "$file" "$live_dir/${file##*/}"
+    done
+    cp "$temp/filesystem.module" "$live_dir/filesystem.module"
+    [[ ! -f "$temp/md5sum.txt" ]] || cp "$temp/md5sum.txt" "$BUILD_DIR/binary/md5sum.txt"
+    _ok "Hybrid ISO now contains $num FAT32-safe live layers ($ALTERNIX_BUILD_MODE)."
+    rm -rf -- "$temp"
+}
+
+# ── Finish / verify an existing ISO without rebuilding ──────────────
+# live-build may preserve `EFI/boot/bootia32.efi` (Claude's original
+# Rufus ISO-mode layout). ISO9660 Rock Ridge filenames are case-sensitive
+# to xorriso, even though the extracted FAT32 USB is case-insensitive.
+# Therefore NEVER assume /EFI/BOOT/BOOTIA32.EFI when extracting from ISO.
+# Use the exact relative filename from the binary/ tree instead.
+_finalize_iso() {
+    local existing_iso expected_ia32 expected_x64 visor_payload
+    local iso_ia32_path iso_x64_path embedded_efi tmp copied size
+    _step "Verifying and finalising existing ISO"
+    command -v xorriso >/dev/null 2>&1 || _die "xorriso is required to verify an existing ISO."
+    command -v mcopy >/dev/null 2>&1 || _die "mtools is required to verify an existing ISO."
+    [[ -d "$BUILD_DIR/binary" ]] || \
+        _die "Missing $BUILD_DIR/binary. Cannot finalise: the completed build files are absent."
+    existing_iso=$(find "$BUILD_DIR" -maxdepth 1 -type f -name '*.iso' -print -quit)
+    [[ -n "$existing_iso" && -s "$existing_iso" ]] || \
+        _die "No completed ISO in $BUILD_DIR. Run the normal build if live-build did not generate one."
+    expected_ia32=$(find "$BUILD_DIR/binary/EFI" -type f -iname bootia32.efi -print -quit 2>/dev/null)
+    expected_x64=$(find "$BUILD_DIR/binary/EFI" -type f -iname bootx64.efi -print -quit 2>/dev/null)
+    [[ -n "$expected_ia32" && -s "$expected_ia32" ]] || \
+        _die "Missing IA32 GRUB from binary/EFI; this build cannot be finalised."
+    [[ -n "$expected_x64" && -s "$expected_x64" ]] || \
+        _die "Missing x64 loader from binary/EFI; this build cannot be finalised."
+    iso_ia32_path="/${expected_ia32#"$BUILD_DIR/binary/"}"
+    iso_x64_path="/${expected_x64#"$BUILD_DIR/binary/"}"
+    # Only live-preview promises a prebuilt desktop; net-install downloads
+    # AlternixDE later if the user selects it on the target machine.
+    if [[ "$ALTERNIX_BUILD_MODE" == "live-preview" ]]; then
+        [[ -s "$BUILD_DIR/chroot/etc/alternix/de-baked" ]] || \
+            _die "The live-preview image has no prebuilt Alternix desktop."
+    else
+        [[ ! -e "$BUILD_DIR/chroot/etc/alternix/de-baked" ]] || \
+            _die "Net-install unexpectedly contains a prebuilt AlternixDE marker."
+    fi
+    local sq_info
+    [[ -s "$BUILD_DIR/binary/live/filesystem.squashfs" ]] || _die "Missing live filesystem.squashfs."
+    local layer layer_name
+    if [[ -f "$BUILD_DIR/binary/live/filesystem.module" ]]; then
+        while IFS= read -r layer_name || [[ -n "$layer_name" ]]; do
+            [[ -z "$layer_name" ]] && continue
+            [[ "$layer_name" =~ ^filesystem(-[0-9]+)?\.squashfs$ ]] || _die "Invalid rootfs layer: $layer_name"
+            layer="$BUILD_DIR/binary/live/$layer_name"
+            [[ -s "$layer" ]] || _die "Missing rootfs layer: $layer_name"
+            (( $(stat -c %s "$layer") <= 4294967295 )) || _die "Layer exceeds FAT32: $layer_name"
+        done < "$BUILD_DIR/binary/live/filesystem.module"
+    else
+        (( $(stat -c %s "$BUILD_DIR/binary/live/filesystem.squashfs") <= 4294967295 )) || \
+            _die "The rootfs still exceeds FAT32's per-file limit."
+    fi
+    sq_info=$(unsquashfs -s "$BUILD_DIR/binary/live/filesystem.squashfs" 2>&1) || \
+        _die "Cannot read squashfs header."
+    printf '%s\n' "$sq_info" | grep -Eq '^Compression[[:space:]]+(zstd|gzip|lz4)([[:space:]]|$)' || \
+        _die "The existing image is not compressed with a fast tablet-friendly codec."
+    embedded_efi="$BUILD_DIR/binary/boot/grub/efi.img"
+    [[ -s "$embedded_efi" ]] || _die "Embedded EFI image missing from binary/boot/grub."
+
+    _info "Actual ISO path for IA32 GRUB: $iso_ia32_path"
+    _info "Actual ISO path for x64 loader: $iso_x64_path"
+    if ! xorriso -indev "$existing_iso" -report_el_torito plain -report_system_area plain \
+            > "$BUILD_DIR/iso-boot-report.txt" 2>&1; then
+        _die "Cannot read boot metadata from $existing_iso."
+    fi
+    grep -Eq 'El Torito boot img.*UEFI' "$BUILD_DIR/iso-boot-report.txt" || \
+        _die "Completed ISO lacks an El Torito UEFI boot image."
+
+    tmp=$(mktemp -d) || _die "Cannot create temporary verification directory."
+    if ! xorriso -osirrox on -indev "$existing_iso" \
+         -extract /boot/grub/efi.img "$tmp/efi.img" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        _die "Completed ISO has no embedded EFI boot image."
+    fi
+    if ! cmp -s "$tmp/efi.img" "$embedded_efi"; then
+        rm -rf "$tmp"
+        _die "Completed ISO contains a stale EFI image that differs from binary/boot/grub/efi.img."
+    fi
+    if [[ "$(dd if="$tmp/efi.img" bs=1 skip=82 count=8 2>/dev/null)" != 'FAT32   ' ]]; then
+        rm -rf "$tmp"
+        _die "Embedded EFI image is not FAT32."
+    fi
+    for label in BOOTIA32.EFI BOOTX64.EFI; do
+        if ! mcopy -o -i "$tmp/efi.img" "::/EFI/BOOT/$label" "$tmp/$label" >/dev/null 2>&1; then
+            rm -rf "$tmp"
+            _die "Completed ISO's embedded FAT32 boot image is missing $label."
+        fi
+    done
+    if ! cmp -s "$tmp/BOOTIA32.EFI" "$expected_ia32" || \
+       ! cmp -s "$tmp/BOOTX64.EFI" "$expected_x64"; then
+        rm -rf "$tmp"
+        _die "The completed ISO's embedded EFI loaders do not match binary/EFI."
+    fi
+    _ok "Embedded FAT32 boot image contains matching GRUB IA32 and x64 EFI loaders."
+
+    # A Rufus ISO-mode USB uses the normal ISO tree. xorriso must use the
+    # actual *case-preserved* Rock Ridge filenames, not canonical FAT names.
+    if ! xorriso -osirrox on -indev "$existing_iso" \
+         -extract "$iso_ia32_path" "$tmp/from-iso-ia32.efi" >/dev/null 2>&1; then
+        _err "Expected file missing from ISO tree: $iso_ia32_path"
+        _info "Actual /EFI entries recorded in ISO (for diagnosis):"
+        xorriso -indev "$existing_iso" -find /EFI -type f -exec echo -- 2>&1 | tail -40 || true
+        rm -rf "$tmp"
+        _die "Completed ISO has no IA32 GRUB at its expected Rufus ISO-mode path."
+    fi
+    if ! xorriso -osirrox on -indev "$existing_iso" \
+         -extract "$iso_x64_path" "$tmp/from-iso-x64.efi" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        _die "Completed ISO has no x64 loader at its expected Rufus ISO-mode path: $iso_x64_path"
+    fi
+    if ! cmp -s "$tmp/from-iso-ia32.efi" "$expected_ia32" || \
+       ! cmp -s "$tmp/from-iso-x64.efi" "$expected_x64"; then
+        rm -rf "$tmp"
+        _die "One or both ISO-tree EFI loaders do not match the generated files."
+    fi
+    visor_payload="$BUILD_DIR/binary/EFI/visor/visor_x64.efi"
+    if [[ -s "$visor_payload" ]] && ! cmp -s "$visor_payload" "$expected_x64"; then
+        rm -rf "$tmp"
+        _die "The completed ISO's x64 loader is not the generated Visor executable."
+    fi
+    rm -rf "$tmp"
+    _ok "Finished ISO: 32-bit GRUB and 64-bit Visor verified in both boot layouts."
+
+    _step "Finalising"
+    _info "Copying finished ISO ($(du -h "$existing_iso" | cut -f1)) to $OUTPUT_ISO..."
+    if ! _monitored_cmd "Copying final ISO" cp --reflink=auto "$existing_iso" "$OUTPUT_ISO"; then
+        _die "Cannot copy finished ISO to $OUTPUT_ISO."
+    fi
+    [[ -s "$OUTPUT_ISO" ]] || _die "Final ISO copy is empty."
+    size=$(du -sh "$OUTPUT_ISO" | cut -f1)
+    _ok "Alternix installer ISO ready: $OUTPUT_ISO ($size)"
+    _info "Boot defaults: 32-bit UEFI = GRUB; 64-bit UEFI = Visor; legacy BIOS = GRUB."
+}
+
 # ── Root check ────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || _die "Run as root: sudo bash build-iso.sh"
+
+# Two build profiles: a small network installer or a complete, prebuilt
+# live desktop. --mode is provided for automated builds; normal use shows
+# the requested choice menu before any downloads or build-directory cleanup.
+if [[ "${1:-}" == '--finalize-existing' ]]; then
+    [[ -s "$BUILD_DIR/chroot/etc/alternix/iso-mode" ]] || \
+        _die "Cannot determine the existing ISO mode from build/chroot/etc/alternix/iso-mode."
+    ALTERNIX_BUILD_MODE=$(cat "$BUILD_DIR/chroot/etc/alternix/iso-mode")
+    case "$ALTERNIX_BUILD_MODE" in
+        net-install|live-preview) ;;
+        *) _die "Unknown existing ISO mode: $ALTERNIX_BUILD_MODE" ;;
+    esac
+    OUTPUT_ISO="${SCRIPT_DIR}/alternix-${ALTERNIX_BUILD_MODE}.iso"
+    _finalize_iso
+    exit 0
+elif [[ "${1:-}" == '--mode' && $# -eq 2 ]]; then
+    ALTERNIX_BUILD_MODE="$2"
+elif [[ $# -eq 0 ]]; then
+    _step "Choose AlternixOS x86-64 ISO build"
+    printf '%s\n' \
+        '  1) x86-64 net-install  — minimal installer; fetch AlternixDE from GitHub if selected' \
+        '  2) x86-64 live-preview — prebuilt AlternixDE, Live boot and fast installation' \
+        ''
+    if [[ ! -t 0 ]]; then
+        _die "No interactive terminal. Specify --mode net-install or --mode live-preview."
+    fi
+    while true; do
+        read -r -p '  Select ISO [1/2]: ' _build_choice
+        case "$_build_choice" in
+            1) ALTERNIX_BUILD_MODE=net-install; break ;;
+            2) ALTERNIX_BUILD_MODE=live-preview; break ;;
+            *) _err 'Choose 1 or 2.' ;;
+        esac
+    done
+else
+    _die "Usage: sudo bash build-iso.sh [--mode net-install|live-preview|--finalize-existing]"
+fi
+case "$ALTERNIX_BUILD_MODE" in
+    net-install|live-preview) ;;
+    *) _die "Invalid ISO mode: $ALTERNIX_BUILD_MODE (use net-install or live-preview)." ;;
+esac
+OUTPUT_ISO="${SCRIPT_DIR}/alternix-${ALTERNIX_BUILD_MODE}.iso"
+_step "Building x86-64 $ALTERNIX_BUILD_MODE ISO"
+if [[ "$ALTERNIX_BUILD_MODE" == "net-install" ]]; then
+    _info 'No prebuilt desktop. The graphical/text installer will clone AlternixDE only if selected.'
+else
+    _info 'Prebuild AlternixDE into the ISO. Include Try Alternix (Live) and fast desktop copy.'
+fi
 
 # ── Dependencies ──────────────────────────────────────────────────
 _step "Checking dependencies"
@@ -199,7 +560,7 @@ _pick_compression() {
     probe_dir="$(mktemp -d)"
     for c in zstd lz4 gzip xz; do
         rc=1
-        ( cd "$probe_dir" && lb config --compression "$c" ) >/dev/null 2>&1 && rc=0
+        ( cd "$probe_dir" && lb config --chroot-squashfs-compression-type "$c" ) >/dev/null 2>&1 && rc=0
         rm -rf "${probe_dir:?}"/* "${probe_dir:?}"/.??* 2>/dev/null || true
         if [[ $rc -eq 0 ]]; then
             rm -rf "$probe_dir"
@@ -221,7 +582,7 @@ if [[ -z "$LB_COMPRESSION_CHOICE" ]]; then
     _info "If that default is xz, copy installs will be slow to unpack."
     COMPRESSION_ARG=()
 else
-    COMPRESSION_ARG=(--compression "$LB_COMPRESSION_CHOICE")
+    COMPRESSION_ARG=(--chroot-squashfs-compression-type "$LB_COMPRESSION_CHOICE")
     case "$LB_COMPRESSION_CHOICE" in
         zstd) _ok  "Compression: zstd (fast to unpack, small)" ;;
         lz4)  _ok  "Compression: lz4 (fastest to unpack, larger ISO)" ;;
@@ -307,26 +668,21 @@ done
 [[ $_src_set -eq 0 ]] && echo 'LB_APT_SOURCE_ARCHIVES="false"' >> config/common
 _ok "Source package indices disabled."
 
-# FORCE THE SQUASHFS COMPRESSION — DO NOT RELY ON THE lb config FLAG
-# Passing --compression to lb config is accepted without error but does
-# not always reach mksquashfs: a build configured with "gzip" still
-# produced an xz-compressed squashfs. The same problem applies to
-# LB_INITSYSTEM above, which is why that is written here too. Writing
-# the value straight into config/binary is what actually takes effect.
-#
-# This matters because the target unpacks this squashfs during every
-# install. xz decompresses at roughly a tenth the speed of gzip or
-# zstd, so getting this wrong costs minutes on every machine.
-if [[ -n "${LB_COMPRESSION_CHOICE}" ]]; then
-    if grep -q '^LB_COMPRESSION=' config/binary 2>/dev/null; then
-        sed -i "s|^LB_COMPRESSION=.*|LB_COMPRESSION=\"${LB_COMPRESSION_CHOICE}\"|" \
-            config/binary
-    else
-        echo "LB_COMPRESSION=\"${LB_COMPRESSION_CHOICE}\"" >> config/binary
-    fi
-    _ok "Squashfs compression forced to ${LB_COMPRESSION_CHOICE} in config/binary."
-    _info "Verify after the build: the mksquashfs summary should say"
-    _info "\"${LB_COMPRESSION_CHOICE} compressed\", not \"xz compressed\"."
+# --compression controls source/tar archives, NOT filesystem.squashfs.
+# The matching squashfs option and variable in live-build 20250505 are
+# --chroot-squashfs-compression-type and LB_CHROOT_SQUASHFS_COMPRESSION_TYPE.
+# Never silently fall back to slow xz on an Atom-class tablet.
+if [[ -n "$LB_COMPRESSION_CHOICE" ]]; then
+    for _cf in config/common config/binary; do
+        if grep -q '^LB_CHROOT_SQUASHFS_COMPRESSION_TYPE=' "$_cf" 2>/dev/null; then
+            sed -i "s|^LB_CHROOT_SQUASHFS_COMPRESSION_TYPE=.*|LB_CHROOT_SQUASHFS_COMPRESSION_TYPE=\"${LB_COMPRESSION_CHOICE}\"|" "$_cf"
+        else
+            printf 'LB_CHROOT_SQUASHFS_COMPRESSION_TYPE="%s"\n' "$LB_COMPRESSION_CHOICE" >> "$_cf"
+        fi
+    done
+    _ok "Actual squashfs compression configured: ${LB_COMPRESSION_CHOICE}"
+else
+    _die "Cannot configure a fast squashfs codec. This would produce an exceptionally slow tablet installer."
 fi
 
 # Find and patch lb_chroot_live-packages to skip live-config-systemd.
@@ -515,24 +871,13 @@ ncurses-bin
 xterm
 
 # ── X server (graphical installer + AlternixDE live session) ─────
-# XLIBRE CONFLICT — READ BEFORE ADDING xserver-xorg-core HERE
-# install-alternix_devuan.sh adds the XLibre repo and installs XLibre,
-# which is a fork of the X server and REPLACES xserver-xorg-core. If
-# both are pulled in, apt has to resolve that conflict during the ISO
-# build and the loser is whichever it decides. Only the pieces XLibre
-# does not itself provide are listed here; hook 0080 installs the
-# server. If you drop AlternixDE from the image, xserver-xorg-core
-# must be added back or there will be no X at all.
+# XLibre and its input drivers are installed by the bundled AlternixDE
+# installer during the desktop prebuild. Do not preinstall conflicting
+# stock Xorg packages here. Missing modules fail the build validation.
 xinit
 x11-xserver-utils
 x11-utils
 xinput
-# INPUT DRIVERS COME FROM XLIBRE — DO NOT ADD THE XORG ONES BACK
-# AlternixDE installs xlibre, which replaces xserver-xorg-core and
-# brings its own xserver-xlibre-input-* drivers. Listing
-# xserver-xorg-input-libinput or -evdev here puts two packages that
-# replace each other into the same install, which is what apt was
-# being asked to resolve when the desktop package install failed.
 
 # ── Qt5 runtime + build (osm-install and the osm-apps) ───────────
 libqt5widgets5
@@ -563,10 +908,7 @@ rsync
 ntfs-3g
 
 # ── Privilege escalation ──────────────────────────────────────────
-# REQUIRED BY THE ALTERNIXDE BUILD — DO NOT REMOVE
-# install-alternix_devuan.sh calls sudo 134 times. Without this
-# package every one of them fails with 'command not found', even
-# though the hook already runs as root.
+# Required for the AlternixDE prebuild and later installed system.
 sudo
 
 # ── Build tools ───────────────────────────────────────────────────
@@ -664,13 +1006,26 @@ if grep -Eq '^[[:space:]]*firmware-(ipw2x00|ivtv)([[:space:]]|$)' \
     config/package-lists/alternix-installer.list.chroot; then
     _die "firmware-ipw2x00 and firmware-ivtv require interactive licence acceptance; cannot install unattended."
 fi
+if [[ "$ALTERNIX_BUILD_MODE" == "net-install" ]]; then
+    # Without the AlternixDE prebuild, XLibre is not installed. Provide
+    # Xorg and libinput so osm-install still starts on tablets/touchscreens.
+    cat >> config/package-lists/alternix-installer.list.chroot << 'NETXORG'
+# Graphical net-installer display/input (no desktop environment)
+xserver-xorg-core
+xserver-xorg-input-libinput
+xserver-xorg-video-fbdev
+xserver-xorg-video-vesa
+dbus-x11
+NETXORG
+fi
 _ok "Firmware selection: unattended-safe packages; no third-party downloaders or licence prompts."
 _ok "Package lists written."
 
 # ── Copy installer scripts ────────────────────────────────────────
 _step "Embedding installer scripts"
 
-mkdir -p config/includes.chroot/installer
+mkdir -p config/includes.chroot/installer config/includes.chroot/etc/alternix
+printf '%s\n' "$ALTERNIX_BUILD_MODE" > config/includes.chroot/etc/alternix/iso-mode
 cp -r "${SCRIPT_DIR}/installer/"* config/includes.chroot/installer/
 chmod +x config/includes.chroot/installer/*.sh
 
@@ -756,30 +1111,35 @@ else
     _info "No cursor theme at ${CURSOR_SRC} - using the X default."
 fi
 
-# ── AlternixDE build hook ─────────────────────────────────────────
-# COPY INSTALL — this is what makes the 5-minute install possible.
-# The desktop is compiled ONCE here, at ISO build time, instead of
-# 41 serial g++ runs on the target CPU during every install.
-_step "Configuring AlternixDE build hook"
+# ── Conditional desktop prebuild and graphical installer (one chroot stage) ──
+# Live-build executes this once, before compressing the final rootfs.
+# There is no separate desktop build hook and no package-manager command rewriting.
+_step "Configuring $ALTERNIX_BUILD_MODE desktop and graphical installer"
 
-cat > config/hooks/normal/0080-alternix-de.hook.chroot << 'HOOKEOF'
+cat > config/hooks/normal/0090-osm-install.hook.chroot << 'HOOKEOF'
 #!/bin/bash
-# Build AlternixDE into the live chroot. Because the live squashfs IS
-# the system copied onto the target, everything built here lands on the
-# installed machine as a plain file copy.
+# Compile the graphical installer inside the chroot, where Qt5 dev
+# is present. Building here rather than on the host guarantees the
+# binary matches the runtime libraries it will actually link against.
 set -e
+
+# This existing hook compiles osm-install in BOTH build modes. Desktop
+# compilation is needed ONLY for live-preview; net-install uses the
+# system-image base and installs the chosen desktop on the target later.
+if [ "$(cat /etc/alternix/iso-mode 2>/dev/null)" = live-preview ]; then
+
+# Build the live desktop and system-wide applications before compiling
+# the installer GUI. This is still the same 0090 chroot stage.
 
 DE_REPO="${ALTERNIXDE_REPO:-https://github.com/DansDesigns/AlternixDE}"
 
-# CLONE PATH IS NOT ARBITRARY — DO NOT CHANGE
-# install-alternix_devuan.sh hardcodes ALT_ROOT="$HOME/Alternix" and
-# exits immediately if that directory is absent. It also reads
-# ~/Alternix/installers, ~/Alternix/configs and ~/Alternix/update by
-# the same absolute path. The repo must be cloned to exactly this
-# location, not a temporary directory.
+# Use the repo layout expected by the AlternixDE installer: the repo
+# contains Alternix/ assets plus the root install script. The root user's
+# home is the temporary build account; normal users inherit /etc/skel.
 export HOME=/root
 DE_DIR="${HOME}/Alternix"
 BUILD_LOG=/tmp/alternixde-build.log
+: > "$BUILD_LOG"
 
 echo "  · Cloning AlternixDE into ${DE_DIR}..."
 rm -rf "$DE_DIR"
@@ -791,31 +1151,33 @@ fi
 
 cd "$DE_DIR"
 
-if [ ! -f install-alternix_devuan.sh ]; then
-    echo "  x install-alternix_devuan.sh not found in the repo root."
+if [ ! -d "$DE_DIR/Alternix/apps" ] || [ ! -d "$DE_DIR/Alternix/configs" ]; then
+    echo '  x AlternixDE repo does not contain the expected desktop source and configs.'
     exit 1
 fi
 
-# CRLF STRIP — DO NOT REMOVE
-# A carriage return on the shebang line makes the kernel look for an
-# interpreter literally named "bash\r", which fails with a bare
-# "no such file or directory" that points at nothing useful.
-sed -i 's/\r$//' install-alternix_devuan.sh
-chmod +x install-alternix_devuan.sh
+# Run the exact APT-only AlternixDE installer supplied with this ISO
+# builder. Do not parse, sed-rewrite, or substitute package-manager
+# commands from the cloned repository: command-shape assumptions caused
+# repeated builds to fail before even attempting the desktop.
+if [ ! -s /installer/install-alternix_devuan.sh ]; then
+    echo '  x Bundled AlternixDE installer is missing from /installer.'
+    exit 1
+fi
+cp -f /installer/install-alternix_devuan.sh "$DE_DIR/install-alternix_devuan.sh"
+sed -i 's/\r$//' "$DE_DIR/install-alternix_devuan.sh"
+chmod +x "$DE_DIR/install-alternix_devuan.sh"
 
-# ANSWERING THE PROMPTS — DO NOT SIMPLIFY
-# The script asks three times: username (line 34), telephony choice
-# (line 176) and restart-or-continue (line 1207). It also runs under
-# `set -e`, so a bare `read` returning non-zero at EOF kills it
-# instantly with exit 1 and no error message at all.
-#
-# "2" is Skip for telephony and Continue for the final prompt, and
-# `yes` never ends, so there is no EOF to trip `set -e`.
-#
-# `{ echo root; yes 2; }` answers the username once and then feeds "2"
-# to everything after it — "2" being Skip for telephony. The stream
-# never ends, so no EOF spin. `timeout` is the backstop in case a
-# future prompt rejects "2" and loops anyway.
+# The desktop installer cleans up its source tree during installation.
+# Stash the repository BEFORE running it so copy-installed systems still
+# have the exact sources without downloading them again.
+mkdir -p /usr/share/alternix
+rm -rf /usr/share/alternix/AlternixDE
+cp -a "$DE_DIR" /usr/share/alternix/AlternixDE
+
+# Noninteractive build: username root; select "2" for any remaining
+# optional prompts and Continue rather than reboot. The input stream stays
+# open so the installer's read commands do not abort on EOF under set -e.
 export TARGET_USER="root"
 export DEBIAN_FRONTEND=noninteractive
 # `clear` on line 3 of that script fails under TERM=dumb or an unset
@@ -824,15 +1186,27 @@ export TERM=xterm
 
 echo "  · Building AlternixDE (this takes a while; output -> ${BUILD_LOG})"
 
-# BUILD WRAPPERS — see /installer/de-shims.sh. Without them the
-# auto-cpufreq installer gets "2" from this stream instead of "i" and
-# aborts, and its daemon start then fails because OpenRC is not running
-# inside this chroot. Either one ends the desktop build under set -e.
+# BUILD WRAPPERS — see /installer/de-shims.sh. They supply the
+# noninteractive auto-cpufreq installer selection, register its OpenRC
+# service without probing missing chroot CPU governors, and defer actual
+# daemon startup until boot on real hardware.
+_de_shims_active=0
+cleanup_de_build_shims() {
+    if [ "$_de_shims_active" = 1 ] && [ -f /installer/de-shims.sh ]; then
+        bash /installer/de-shims.sh remove / || true
+    fi
+}
+trap cleanup_de_build_shims EXIT
 if [ -f /installer/de-shims.sh ]; then
-    bash /installer/de-shims.sh add / >>"$BUILD_LOG" 2>&1
+    bash /installer/de-shims.sh add / >>"$BUILD_LOG" 2>&1 || {
+        echo '  x Could not install temporary build shims.'
+        exit 1
+    }
+    _de_shims_active=1
     export PATH="/usr/local/lib/alternix-de-shims:${PATH}"
 else
-    echo "  ! /installer/de-shims.sh missing; auto-cpufreq will likely fail."
+    echo '  x /installer/de-shims.sh missing.'
+    exit 1
 fi
 
 set +e
@@ -841,99 +1215,20 @@ set +e
 DE_RC=$?
 set -e
 
-# Remove them before anything else, so neither wrapper ends up in the
-# image that every installed system is copied from.
-[ -f /installer/de-shims.sh ] && bash /installer/de-shims.sh remove /
+# Remove temporary wrappers whether the build succeeded or not.
+cleanup_de_build_shims
+_de_shims_active=0
+trap - EXIT
 
 if [ "$DE_RC" -ne 0 ]; then
-    if [ "$DE_RC" -eq 124 ]; then
-        echo "  x AlternixDE build timed out after 2 hours (likely stuck on a prompt)."
-    else
-        echo "  x AlternixDE build failed (exit ${DE_RC})."
-    fi
-    echo "  ---- last 40 lines of the build log ----"
-    tail -40 "$BUILD_LOG" | sed 's/^/      /'
-
-    # DIAGNOSTICS — nala renders dependency failures as a Python
-    # traceback with the package list truncated ("... +71"), which does
-    # not say which dependency is unsatisfiable. Plain apt prints a
-    # readable explanation, so ask it directly and record the answer.
-    echo "  ---- apt dependency state ----"
-    apt-get check 2>&1 | tail -20 | sed 's/^/      /'
-    # PER-PACKAGE BISECT
-    # nala marks all ~76 packages at once and reports the failure
-    # against whichever it touched first, which is alacritty purely
-    # because the list is alphabetical. alacritty installs fine on its
-    # own, so the real culprit is elsewhere in the list. Testing each
-    # package separately is the only way to name it.
-    echo "  ---- testing each package individually ----"
-    # Anchor on a line ENDING in a backslash: the script has four other
-    # "nala install" lines, and matching the first one picks up
-    # "ca-certificates curl" from line 116 instead of the real list.
-    _PKGS=$(sed 's/\r$//' "${DE_DIR}/install-alternix_devuan.sh" 2>/dev/null \
-            | awk '/nala install -y[[:space:]]*\\$/{f=1} f{print; if ($0 !~ /\\$/) exit}' \
-            | sed 's/.*nala install -y//' | tr -d '\\' | tr ' ' '\n' \
-            | grep -v '^$' | sort -u)
-
-    if [ -z "$_PKGS" ]; then
-        echo "      (could not extract the package list from the script)"
-    else
-        _N=0; _BAD=0
-        for _p in $_PKGS; do
-            _N=$((_N + 1))
-            if ! apt-get install -s -y "$_p" >/dev/null 2>&1; then
-                _BAD=$((_BAD + 1))
-                echo "      CANNOT INSTALL: ${_p}"
-                apt-get install -s -y "$_p" 2>&1 | grep -iE "^E:|Depends|Conflicts" \
-                    | head -5 | sed 's/^/          /'
-            fi
-        done
-        echo "      checked ${_N} packages, ${_BAD} cannot be installed on their own"
-        if [ "$_BAD" -eq 0 ]; then
-            echo "      All install individually, so the fault is a conflict"
-            echo "      between two of them rather than a missing package."
-        fi
-    fi
-
-    echo "  ---- packages not in state ii ----"
-    dpkg -l 2>/dev/null | awk 'NR>5 && $1 != "ii" {print $1, $2}' \
-        | head -20 | sed 's/^/      /' 
-
-    # NON-FATAL BY DEFAULT — DELIBERATE
-    # The primary deliverable is the graphical installer. Failing the
-    # whole ISO build because the desktop could not be baked in would
-    # block that for a problem that has a working fallback: without a
-    # baked desktop, install.sh simply builds AlternixDE on the target
-    # the way it always did. Slower, but it installs.
-    #
-    # Set ALTERNIXDE_REQUIRED=1 in the environment to make this fatal
-    # once the dependency problem is solved.
-    if [ "${ALTERNIXDE_REQUIRED:-0}" = "1" ]; then
-        echo "  x ALTERNIXDE_REQUIRED=1 — failing the build."
-        exit 1
-    fi
-
-    # MARKER — DO NOT REMOVE
-    # install.sh checks for this. Without it the copy install would
-    # skip install_desktop on the assumption the image already has
-    # AlternixDE, and produce a system with no desktop at all.
-    mkdir -p /etc/alternix
-    echo "AlternixDE was not baked into this image." > /etc/alternix/de-missing
-    date >> /etc/alternix/de-missing
-
-    # Stash it even on failure — this is exactly the case where
-    # install_desktop.sh has to build the desktop on the target, so
-    # having the repository already present saves the second clone.
-    mkdir -p /usr/share/alternix
-    rm -rf /usr/share/alternix/AlternixDE
-    cp -a "$DE_DIR" /usr/share/alternix/AlternixDE
-    echo "  ! Repository stashed at /usr/share/alternix/AlternixDE"
-
-    echo "  ! Continuing without a baked desktop."
-    echo "  ! Installs will build AlternixDE on the target instead."
-    cd /
-    rm -rf "$DE_DIR"
-    exit 0
+    echo "  x AlternixDE prebuild failed (exit ${DE_RC})."
+    [ "$DE_RC" -ne 124 ] || echo '  x Desktop build exceeded the 2-hour timeout.'
+    echo '  ---- Last 70 lines from the desktop installation log ----'
+    tail -70 "$BUILD_LOG" | sed 's/^/      /'
+    echo '  ---- APT dependency status ----'
+    apt-get check 2>&1 | tail -25 | sed 's/^/      /' || true
+    echo '  x No ISO will be issued without the complete prebuilt desktop.'
+    exit 1
 fi
 
 # SKEL COPY — DO NOT REMOVE
@@ -954,38 +1249,70 @@ done
 # place it would ship passwordless root on every installed machine.
 rm -f /etc/sudoers.d/alternix-nopasswd
 
-# KEEP THE REPOSITORY IN THE IMAGE — DO NOT DELETE IT
-# It was previously removed here, which meant install_desktop.sh had to
-# clone the same repository a second time on the target machine. Since
-# the live squashfs IS what gets copied onto the target, stashing it
-# here makes it available at install time for the cost of a few MB.
-#
-# The bigger gain is not the seconds saved cloning: it removes the
-# install's dependency on GitHub being reachable at that moment.
-mkdir -p /usr/share/alternix
-rm -rf /usr/share/alternix/AlternixDE
-cp -a "$DE_DIR" /usr/share/alternix/AlternixDE
-echo "  + Repository stashed at /usr/share/alternix/AlternixDE"
+# Source repository was retained before the installer ran, because that
+# installer may delete its working directory as its final cleanup step.
+if [ ! -f /usr/share/alternix/AlternixDE/install-alternix_devuan.sh ]; then
+    echo '  x Preserved AlternixDE source is missing.'
+    exit 1
+fi
+echo '  + AlternixDE source retained for copy-installed systems.'
 
+# A zero exit code alone is insufficient: check the essential desktop,
+# window manager and its applications before certifying the live image.
+for binary in /root/.qtile_venv/bin/qtile /usr/local/bin/osm-launcher \
+              /usr/local/bin/osm-settings /usr/local/bin/osm-files; do
+    if [ ! -x "$binary" ]; then
+        echo "  x AlternixDE reports success but required binary is missing: $binary"
+        tail -60 "$BUILD_LOG" 2>/dev/null || true
+        exit 1
+    fi
+done
+[ -f /root/.config/qtile/config.py ] || {
+    echo '  x Alternix Qtile configuration is absent from the built image.'
+    exit 1
+}
+# The build ran as root, but installation creates an ordinary user.
+# The venv in /root is inaccessible to that user. The upstream installer
+# also installs a system-wide qtile; verify it and configure the new
+# user's session to use that executable, not /root/.qtile_venv.
+QTILE_GLOBAL=$(command -v qtile 2>/dev/null || true)
+if [ -z "$QTILE_GLOBAL" ] || [ ! -x "$QTILE_GLOBAL" ]; then
+    echo '  x System-wide Qtile is missing; a copied installation would not log in.'
+    exit 1
+fi
+# The desktop installer initially links this path to root's private venv.
+# Copy-installed users cannot access /root: point it to the global binary.
+mkdir -p /usr/lib/udev
+ln -sfn "$QTILE_GLOBAL" /usr/lib/udev/qtile
+cat > /etc/skel/.xinitrc <<'USERXINIT'
+#!/bin/sh
+exec dbus-launch --exit-with-session /usr/local/bin/qtile start
+USERXINIT
+# Resolve qtile's actual location in case the distro uses /usr/bin.
+sed -i "s|/usr/local/bin/qtile|${QTILE_GLOBAL}|" /etc/skel/.xinitrc
+chmod 755 /etc/skel/.xinitrc
+cat > /etc/skel/.bash_profile <<'USERBASH'
+# Log in on tty1 to start the installed Alternix desktop.
+if [ -z "${DISPLAY:-}" ] && [ "$(tty)" = /dev/tty1 ]; then
+    exec startx
+fi
+USERBASH
+mkdir -p /etc/alternix
+rm -f /etc/alternix/de-missing
+printf 'Built into the live filesystem by Alternix ISO Maker\n' > /etc/alternix/de-baked
+# The build-time Alternix script auto-starts X from root/.bash_profile.
+# On live media /etc/profile.d/alternix-installer.sh handles the choice
+# between install and live mode. Prevent a second unintended X session.
+printf '# Alternix live session startup is handled by /etc/profile.d/alternix-installer.sh\n' > /root/.bash_profile
 cd /
 rm -rf "$DE_DIR"
 rm -f "$BUILD_LOG"
-echo "  + AlternixDE built into image."
-HOOKEOF
-chmod +x config/hooks/normal/0080-alternix-de.hook.chroot
-
-_ok "AlternixDE hook written."
-
-# ── osm-install build hook ────────────────────────────────────────
-_step "Configuring installer build hook"
-
-cat > config/hooks/normal/0090-osm-install.hook.chroot << 'HOOKEOF'
-#!/bin/bash
-# Compile the graphical installer inside the chroot, where Qt5 dev
-# is present. Building here rather than on the host guarantees the
-# binary matches the runtime libraries it will actually link against.
-set -e
-
+echo "  + AlternixDE desktop and applications prebuilt and validated."
+else
+    echo '  + Net-install mode: skipping AlternixDE clone/build inside the ISO.'
+    rm -f /etc/alternix/de-baked
+fi
+# ── Graphical installer ──────────────────────────────────────────
 SRC="/installer/osm-install.cpp"
 [ -f "$SRC" ] || { echo "  x ${SRC} not found."; exit 1; }
 
@@ -1002,23 +1329,18 @@ g++ -std=c++17 -Wall -Wextra -O2 -fPIC \
     }
 chmod 755 /usr/local/bin/osm-install
 
-# X INPUT DRIVER CHECK
-# The xorg input drivers are deliberately not in the package list,
-# because xlibre replaces them and having both breaks the desktop
-# package install. That means the ONLY source of input drivers is the
-# xlibre install inside hook 0080. If that hook failed early, the ISO
-# would boot into X with no working touchscreen, mouse or keyboard,
-# and the graphical installer would be unusable with no clue why.
-if ls /usr/lib/xorg/modules/input/*.so >/dev/null 2>&1; then
-    echo "  + X input drivers present:"
-    ls /usr/lib/xorg/modules/input/*.so 2>/dev/null \
-        | xargs -n1 basename | sed 's/^/      /'
-else
-    echo "  x NO X INPUT DRIVERS FOUND."
-    echo "  x The graphical installer will start but nothing will respond"
-    echo "  x to touch, mouse or keyboard. This means the xlibre install"
-    echo "  x in hook 0080 did not complete. Boot with alternix.tui=1 to"
-    echo "  x use the text installer until this is fixed."
+# Both modes require real input drivers for the graphical installer.
+# The live-preview has XLibre and net-install has Xorg/libinput.
+if ! find /usr/lib -name '*_drv.so' -print -quit 2>/dev/null | grep -q .; then
+    echo '  x No Xorg/XLibre input driver modules found after desktop prebuild.'
+    exit 1
+fi
+echo '  + X input drivers installed.'
+if ! command -v Xorg >/dev/null 2>&1 && \
+   ! command -v XLibre >/dev/null 2>&1 && \
+   ! command -v X >/dev/null 2>&1; then
+    echo '  x No Xorg/XLibre display server executable found.'
+    exit 1
 fi
 
 # alternix-net resolves its own directory, so it stays in /installer
@@ -1029,7 +1351,7 @@ echo "  + osm-install compiled."
 HOOKEOF
 chmod +x config/hooks/normal/0090-osm-install.hook.chroot
 
-_ok "Installer build hook written."
+_ok "Graphical installer stage and $ALTERNIX_BUILD_MODE desktop policy configured."
 
 # ── Auto-launch installer on boot ────────────────────────────────
 _step "Configuring auto-launch"
@@ -1071,6 +1393,24 @@ grep -qw "alternix.tui=1" /proc/cmdline 2>/dev/null && _want_tui=1
 [ -x /usr/local/bin/osm-install ] || _want_tui=1
 command -v startx >/dev/null 2>&1 || _want_tui=1
 
+# A separate boot entry selects the real Alternix desktop without opening
+# the installer. Do not start an incomplete/unbaked desktop.
+if grep -qw 'alternix.live=1' /proc/cmdline 2>/dev/null; then
+    if [ ! -s /etc/alternix/de-baked ] || \
+       [ ! -x /root/.qtile_venv/bin/qtile ]; then
+        echo 'Alternix Live is unavailable: this image has no prebuilt desktop.'
+        echo 'The ISO builder must complete the AlternixDE build first.'
+        return 0
+    fi
+    export XCURSOR_THEME=Bibata-Modern-Ice
+    export XCURSOR_SIZE=24
+    echo 'Starting Alternix Live. Launch osm-install to install from this session.'
+    startx /usr/local/bin/alternix-live-session -- -nolisten tcp vt1 \
+        > /tmp/alternix-live-xorg.log 2>&1
+    echo 'Live desktop ended. Run: startx /usr/local/bin/alternix-live-session'
+    return 0
+fi
+
 if [ "$_want_tui" -eq 0 ]; then
     # Cursor theme for the installer session. Xcursor reads these
     # from the environment; without them Qt falls back to the stock
@@ -1096,7 +1436,36 @@ fi
 EOF
 chmod +x config/includes.chroot/etc/profile.d/alternix-installer.sh
 
-_ok "Auto-launch configured."
+# In live-preview, the full desktop is separate from the installer.
+# This launch script is inert in net-install, which has no Live boot entry.
+mkdir -p config/includes.chroot/usr/local/bin \
+         config/includes.chroot/usr/share/applications
+cat > config/includes.chroot/usr/local/bin/alternix-live-session << 'LIVEEOF'
+#!/bin/sh
+export HOME=/root
+export XDG_CONFIG_HOME=/root/.config
+export XDG_CACHE_HOME=/root/.cache
+export XDG_DATA_HOME=/root/.local/share
+export PATH=/root/.qtile_venv/bin:/usr/local/bin:/usr/bin:/bin
+cd /root || exit 1
+[ -x /root/.qtile_venv/bin/qtile ] || {
+    echo 'Alternix Qtile executable is missing from live image.' >&2
+    exit 1
+}
+exec dbus-launch --exit-with-session /root/.qtile_venv/bin/qtile start
+LIVEEOF
+chmod +x config/includes.chroot/usr/local/bin/alternix-live-session
+cat > config/includes.chroot/usr/share/applications/alternix-install.desktop << 'LIVEDESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Install Alternix
+Comment=Install Alternix from the live desktop
+Exec=/usr/local/bin/osm-install
+Icon=system-software-install
+Terminal=false
+Categories=System;
+LIVEDESKTOP
+_ok "Installer and selectable live desktop startup configured."
 
 # ── GRUB config ───────────────────────────────────────────────────
 _step "Configuring GRUB menu"
@@ -1120,6 +1489,12 @@ menuentry "Install Alternix" {
     initrd /live/initrd.img
 }
 
+menuentry "Try Alternix (Live)" {
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.live=1 quiet
+    initrd /live/initrd.img
+}
+
 menuentry "Install Alternix (text mode)" {
     search --no-floppy --file --set=root /live/vmlinuz
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 quiet
@@ -1139,6 +1514,11 @@ menuentry "Install Alternix (safe mode, text)" {
 }
 EOF
 
+if [[ "$ALTERNIX_BUILD_MODE" == "net-install" ]]; then
+    # No full desktop exists on this image; do not offer a broken Live option.
+    sed -i '/^menuentry "Try Alternix (Live)" {/,/^}/d' \
+        config/bootloaders/grub-pc/grub.cfg
+fi
 cp config/bootloaders/grub-pc/grub.cfg config/bootloaders/grub-efi/grub.cfg
 
 # Copy GRUB background from branding folder if present
@@ -1240,6 +1620,12 @@ menuentry "Install Alternix" {
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer quiet
     initrd /live/initrd.img
 }
+
+menuentry "Try Alternix (Live)" {
+    search --no-floppy --file --set=root /live/vmlinuz
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.live=1 quiet
+    initrd /live/initrd.img
+}
 menuentry "Install Alternix (text mode)" {
     search --no-floppy --file --set=root /live/vmlinuz
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 quiet
@@ -1280,6 +1666,9 @@ menuentry "Diagnostics: verify GRUB and boot files (no Linux)" {
     read
 }
 IA32CFG
+if [[ "$ALTERNIX_BUILD_MODE" == "net-install" ]]; then
+    sed -i '/^menuentry "Try Alternix (Live)" {/,/^}/d' "$EFI_STAGE/grub-ia32.cfg"
+fi
 
 # Only load real i386-efi modules. There is NO search_fs_label.mod in
 # Debian/Devuan GRUB; the label-search module is called search_label.mod.
@@ -1329,7 +1718,7 @@ if ! grub-mkstandalone -O i386-efi \
     _die "Cannot build 32-bit GRUB; verify grub-efi-ia32-bin/grub2-common. ISO must not be marked as IA32-bootable."
 fi
 [[ -s "$EFI_STAGE/bootia32.efi" ]] || _die "32-bit GRUB EFI file is empty."
-_ok "Standalone i386-efi GRUB built with 5 installer choices and a boot-file diagnostic."
+_ok "Standalone i386-efi GRUB built with installer choices and a boot-file diagnostic."
 
 # The firmware itself selects the EFI executable on removable media:
 #     EFI/BOOT/BOOTIA32.EFI  -> i386-efi GRUB (text installer)
@@ -1341,6 +1730,47 @@ _ok "Standalone i386-efi GRUB built with 5 installer choices and a boot-file dia
 # the ISO boot menu (via the binary hook below) and the installed system
 # (install_base.sh uses it instead of cloning and compiling at install
 # time, which previously failed whenever gnu-efi or the network did).
+# ── Reproducible Visor EFI executable selection ──────────────────
+# By default, follow upstream HEAD (same as previous releases). A known-
+# working installed visor_x64.efi can instead be imported into
+# visor/visor_x64.efi using ./import-working-visor.sh. This is the best
+# regression test when one older UEFI device boots an earlier Visor build.
+# VISOR_GIT_REF is an optional tag/commit to test a specific upstream build.
+VISOR_OVERRIDE_FILE="${SCRIPT_DIR}/visor/visor_x64.efi"
+if [[ -f "$VISOR_OVERRIDE_FILE" ]]; then
+    _step "Using supplied working Visor EFI executable"
+    [[ -f "${SCRIPT_DIR}/visor/check-efi.py" ]] || \
+        _die "Missing visor/check-efi.py validation helper."
+    command -v python3 >/dev/null || _die "python3 is required to validate supplied Visor EFI."
+    python3 "${SCRIPT_DIR}/visor/check-efi.py" "$VISOR_OVERRIDE_FILE" || \
+        _die "The supplied Visor file is not an x64 UEFI application."
+    mkdir -p config/includes.chroot/usr/share/alternix/visor
+    cp "$VISOR_OVERRIDE_FILE" config/includes.chroot/usr/share/alternix/visor/visor_x64.efi
+    # Reuse matching icons from the known-working ESP when supplied locally.
+    if compgen -G "${SCRIPT_DIR}/visor/icons/*.png" >/dev/null; then
+        mkdir -p config/includes.chroot/usr/share/alternix/visor/icons
+        cp "${SCRIPT_DIR}/visor/icons/"*.png config/includes.chroot/usr/share/alternix/visor/icons/
+    fi
+    if [[ -s "${SCRIPT_DIR}/visor/logo.png" ]]; then
+        cp "${SCRIPT_DIR}/visor/logo.png" config/includes.chroot/usr/share/alternix/visor/logo.png
+    fi
+    printf 'Local EFI executable SHA256: %s\n' "$(sha256sum "$VISOR_OVERRIDE_FILE" | cut -d' ' -f1)" \
+        > config/includes.chroot/usr/share/alternix/visor/SOURCE-REVISION.txt
+    _ok "Prebuilt Visor included: $(sha256sum "$VISOR_OVERRIDE_FILE" | cut -d' ' -f1)"
+    if [[ -n "${VISOR_GIT_REF:-}" ]]; then
+        _info "VISOR_GIT_REF ignored because a local working EFI executable was supplied."
+    fi
+elif [[ -n "${VISOR_GIT_REF:-}" ]]; then
+    # No shell evaluation: the hook reads a single git revision token.
+    [[ "$VISOR_GIT_REF" =~ ^[a-zA-Z0-9._/-]+$ ]] || \
+        _die "VISOR_GIT_REF contains unexpected characters."
+    mkdir -p config/includes.chroot/etc
+    printf '%s\n' "$VISOR_GIT_REF" > config/includes.chroot/etc/alternix-visor-git-ref
+    _info "Pinning upstream Visor to revision: $VISOR_GIT_REF"
+else
+    _info "Visor source: latest upstream HEAD (set VISOR_GIT_REF to freeze revision)."
+fi
+
 cat > config/hooks/normal/0085-visor.hook.chroot << 'HOOKEOF'
 #!/bin/bash
 # Build the Visor boot manager. Non-fatal: if this fails the ISO keeps
@@ -1348,18 +1778,73 @@ cat > config/hooks/normal/0085-visor.hook.chroot << 'HOOKEOF'
 # Visor on the target, as they did before.
 DEST=/usr/share/alternix/visor
 LOG=/tmp/visor-build.log
-rm -rf /tmp/visor-build "$DEST"
+rm -rf /tmp/visor-build
 
-echo "  · Building Visor boot manager..."
-if ! git clone --depth 1 -q https://github.com/IO-ZetZor/Visor-BootManager.git \
-        /tmp/visor-build >"$LOG" 2>&1; then
-    echo "  ! Visor clone failed — ISO will use GRUB."; tail -5 "$LOG"; exit 0
+# config/includes.chroot is populated before the chroot hooks. When a user
+# supplies their KNOWN WORKING installed Visor, do not download and silently
+# replace it with a possibly incompatible newer build.
+if [ -s "$DEST/visor_x64.efi" ]; then
+    echo "  + Using known-working Visor EFI supplied by the ISO builder."
+    sha256sum "$DEST/visor_x64.efi"
+
+    # An imported EFI binary does not contain the external PNG assets.
+    # Visor resolves installer entry names to icons/linux.png; without it,
+    # the GUI shows placeholder squares even though the loader itself works.
+    # Preserve the supplied loader exactly, but fetch/copy assets separately.
+    mkdir -p "$DEST/icons" "$DEST/backgrounds"
+    if [ ! -s "$DEST/icons/linux.png" ] || [ ! -s "$DEST/icons/unknown.png" ]; then
+        echo "  · Restoring Visor menu icons for the supplied EFI loader..."
+        if ! timeout --kill-after=10s 120s git clone --depth 1 -q \
+                https://github.com/IO-ZetZor/Visor-BootManager.git \
+                /tmp/visor-build >"$LOG" 2>&1; then
+            echo "  ! Cannot obtain Visor icons; original EFI binary remains unchanged."
+            tail -10 "$LOG"
+            exit 1
+        fi
+        cp /tmp/visor-build/assets/icons/*.png       "$DEST/icons/"       2>/dev/null || true
+        cp /tmp/visor-build/assets/backgrounds/*.png "$DEST/backgrounds/" 2>/dev/null || true
+        cp /tmp/visor-build/assets/logo.png "$DEST/logo.png" 2>/dev/null || true
+        rm -rf /tmp/visor-build "$LOG"
+    fi
+    if [ ! -s "$DEST/icons/linux.png" ] || [ ! -s "$DEST/icons/unknown.png" ]; then
+        echo "  ! Missing required Visor PNG icons (linux.png / unknown.png)."
+        exit 1
+    fi
+    echo "  + Visor icons available; supplied EFI executable was not replaced."
+    exit 0
+fi
+rm -rf "$DEST"
+
+# If requested, use a SPECIFIC upstream git revision for reproducible tests.
+# Missing/bad explicit ref must be fatal, never fall back to another version.
+VISOR_REF=""
+if [ -s /etc/alternix-visor-git-ref ]; then
+    VISOR_REF=$(head -n 1 /etc/alternix-visor-git-ref)
 fi
 
-# ARCH=x86_64 explicitly. Visor supports only x86_64 and aarch64; there
-# is no 32-bit UEFI build, so 32-bit firmware always boots via BOOTIA32.EFI.
+echo "  · Building upstream Visor boot manager..."
+if ! git clone --depth 1 -q https://github.com/IO-ZetZor/Visor-BootManager.git \
+        /tmp/visor-build >"$LOG" 2>&1; then
+    if [ -n "$VISOR_REF" ]; then
+        echo "  ! Could not download requested Visor revision: $VISOR_REF";
+        tail -5 "$LOG"; exit 1
+    fi
+    echo "  ! Visor clone failed — ISO will use GRUB."; tail -5 "$LOG"; exit 0
+fi
+if [ -n "$VISOR_REF" ]; then
+    echo "  · Selecting Visor upstream revision: $VISOR_REF"
+    if ! git -C /tmp/visor-build fetch --depth 1 origin "$VISOR_REF" >>"$LOG" 2>&1 || \
+       ! git -C /tmp/visor-build checkout --detach FETCH_HEAD >>"$LOG" 2>&1; then
+        echo "  ! Requested Visor revision unavailable: $VISOR_REF"
+        tail -15 "$LOG"
+        exit 1
+    fi
+fi
+VISOR_COMMIT=$(git -C /tmp/visor-build rev-parse HEAD 2>/dev/null || true)
+
+# ARCH=x86_64 matches the upstream Makefile; it builds a PE32+ EFI app.
 if ! ( cd /tmp/visor-build && make ARCH=x86_64 ) >>"$LOG" 2>&1 || \
-   [ ! -f /tmp/visor-build/visor_x64.efi ]; then
+   [ ! -s /tmp/visor-build/visor_x64.efi ]; then
     echo "  ! Visor build failed — ISO will use GRUB. Last lines:"
     tail -15 "$LOG" | sed 's/^/      /'
     rm -rf /tmp/visor-build; exit 0
@@ -1369,8 +1854,10 @@ mkdir -p "$DEST/icons" "$DEST/backgrounds"
 cp /tmp/visor-build/visor_x64.efi "$DEST/"
 cp /tmp/visor-build/assets/icons/*.png       "$DEST/icons/"       2>/dev/null || true
 cp /tmp/visor-build/assets/backgrounds/*.png "$DEST/backgrounds/" 2>/dev/null || true
+cp /tmp/visor-build/assets/logo.png "$DEST/logo.png" 2>/dev/null || true
+printf 'Visor source: https://github.com/IO-ZetZor/Visor-BootManager\nCommit: %s\n' "$VISOR_COMMIT" > "$DEST/SOURCE-REVISION.txt"
 rm -rf /tmp/visor-build "$LOG"
-echo "  + Visor built ($(stat -c %s "$DEST/visor_x64.efi") bytes)."
+echo "  + Visor built from commit $VISOR_COMMIT ($(stat -c %s "$DEST/visor_x64.efi") bytes)."
 HOOKEOF
 chmod +x config/hooks/normal/0085-visor.hook.chroot
 
@@ -1380,20 +1867,19 @@ cat > config/hooks/normal/9998-alternix-efi.hook.binary << 'HOOKEOF'
 STAGE="alternix-efi-stage"
 VISOR="../chroot/usr/share/alternix/visor"
 
-# Find live-build's EFI boot directory, whatever case it used. Everything
-# goes in here so there is only ever one directory once on FAT32.
+# Restore Claude's proven Rufus ISO-mode x64 layout: do not rename or
+# reconstruct live-build's existing EFI/boot directory. On ISO9660 the
+# spelling and layout matter; Rufus copies this tree onto the FAT32 USB.
+# Keep a single directory to avoid name collisions on case-insensitive FAT.
 BOOTDIR=$(find EFI -mindepth 1 -maxdepth 1 -type d -iname boot 2>/dev/null | head -1)
-if [ "$(find EFI -mindepth 1 -maxdepth 1 -type d -iname boot | wc -l)" -gt 1 ]; then
+if [ "$(find EFI -mindepth 1 -maxdepth 1 -type d -iname boot 2>/dev/null | wc -l)" -gt 1 ]; then
     echo "efi: ERROR multiple differently cased EFI boot directories would collide on FAT32"
     exit 1
 fi
-# Canonical, case-correct removable-media boot path on ISO9660 and FAT32.
-if [ -n "$BOOTDIR" ] && [ "$BOOTDIR" != "EFI/BOOT" ]; then
-    [ ! -e EFI/BOOT ] || { echo "efi: ERROR duplicate EFI/BOOT directory"; exit 1; }
-    mv "$BOOTDIR" EFI/BOOT || exit 1
+if [ -z "$BOOTDIR" ]; then
+    mkdir -p EFI/boot || exit 1
+    BOOTDIR=EFI/boot
 fi
-BOOTDIR="EFI/BOOT"
-mkdir -p "$BOOTDIR"
 
 # EFI.IMG HAS NO ROOM TO SPARE — DO NOT GO BACK TO A PLAIN mcopy
 # Sticks written with dd, Etcher or Rufus in DD mode boot from
@@ -1581,19 +2067,23 @@ efi_img_put() {   # $1 = 32-bit loader to place in boot/grub/efi.img
     return 1
 }
 
-# EFI removable-media filenames are always written in canonical casing.
+# Match Claude's existing 64-bit loader filename and directory casing.
+# This preserves the layout Rufus ISO mode presented to the ElitePad.
+# EFI firmware still chooses by architecture: IA32 GRUB vs x64 Visor.
 X64=$(find "$BOOTDIR" -maxdepth 1 -type f -iname bootx64.efi | head -1)
-N32="BOOTIA32.EFI"
-N64="BOOTX64.EFI"
-echo "efi: boot directory is $BOOTDIR"
+case "$(basename "${X64:-bootx64.efi}")" in
+    BOOTX64.EFI) N32="BOOTIA32.EFI"; N64="BOOTX64.EFI" ;;
+    *)           N32="bootia32.efi"; N64="bootx64.efi" ;;
+esac
+echo "efi: existing boot directory $BOOTDIR; x64 loader name $N64"
 
 # ── 32-bit loader ─────────────────────────────────────────────────
 if [ ! -s "$STAGE/bootia32.efi" ]; then
     echo "efi: ERROR missing standalone 32-bit GRUB"
     exit 1
 fi
-# The only canonical FAT file is BOOTIA32.EFI. The boot32.efi alias is not
-# an EFI removable-media fallback and used to confuse diagnostics.
+# IA32 GRUB is independent of x64 Visor. Match existing filename case
+# to avoid accidentally creating duplicate files when Rufus extracts to FAT32.
 find "$BOOTDIR" -maxdepth 1 -type f -iname bootia32.efi -exec rm -f {} +
 cp "$STAGE/bootia32.efi" "$BOOTDIR/$N32" || exit 1
 echo "efi: 32-bit GRUB text selector installed as $BOOTDIR/$N32"
@@ -1612,9 +2102,33 @@ echo "efi: 32-bit GRUB text selector installed as $BOOTDIR/$N32"
 if [ -f "$VISOR/visor_x64.efi" ]; then
     mkdir -p EFI/visor/icons EFI/visor/backgrounds
     cp "$VISOR/visor_x64.efi" EFI/visor/
+    # Retain provenance for comparing EFI executables across ISO builds.
+    if [ -f "$VISOR/SOURCE-REVISION.txt" ]; then
+        cp "$VISOR/SOURCE-REVISION.txt" EFI/visor/SOURCE-REVISION.txt
+    fi
     cp "$VISOR/icons/"*.png       EFI/visor/icons/       2>/dev/null || true
     cp "$VISOR/backgrounds/"*.png EFI/visor/backgrounds/ 2>/dev/null || true
+    if [ -s "$VISOR/logo.png" ]; then
+        cp "$VISOR/logo.png" EFI/visor/logo.png || exit 1
+    fi
+    # An existing filename is not sufficient: reject truncated or non-PNG
+    # files before embedding them in either boot medium. Keep Visor's own
+    # supplied icon art, not a synthetic placeholder image.
+    for icon_name in linux unknown; do
+        icon_path="EFI/visor/icons/$icon_name.png"
+        if [ ! -s "$icon_path" ]; then
+            echo "efi: ERROR missing required Visor icon: $icon_path"
+            exit 1
+        fi
+        png_header=$(head -c 8 "$icon_path" | od -An -tx1 | tr -d ' \n')
+        if [ "$png_header" != 89504e470d0a1a0a ]; then
+            echo "efi: ERROR invalid PNG signature: $icon_path"
+            exit 1
+        fi
+    done
 
+    # Restore Claude's original installer background and Visor menu setup.
+    # These are only for 64-bit Rufus ISO-mode booting; IA32 uses GRUB.
     BG=""
     if [ -f ../chroot/boot/grub/background.png ]; then
         cp ../chroot/boot/grub/background.png EFI/visor/backgrounds/alternix.png
@@ -1640,9 +2154,16 @@ if [ -f "$VISOR/visor_x64.efi" ]; then
     KERN='\live\vmlinuz'
     INITRD='\live\initrd.img'
 
+    # Names such as "Install Alternix" do not match an upstream distro icon.
+    # Explicit absolute ESP paths prevent Visor from drawing its fallback
+    # coloured square when automatic icon-name lookup fails.  All these
+    # images are copied both to EFI/visor/ and into the embedded FAT32 ESP.
+    LINUX_ICON='\EFI\visor\icons\linux.png'
+    FALLBACK_ICON='\EFI\visor\icons\unknown.png'
     entry() {  # $1 name, $2 extra cmdline
         printf '%s\n' "" "entry {" \
             "    name    = \"$1\"" \
+            "    icon    = $LINUX_ICON" \
             "    kernel  = $KERN" \
             "    initrd  = $INITRD" \
             "    cmdline = \"$CMD $2\"" \
@@ -1650,9 +2171,15 @@ if [ -f "$VISOR/visor_x64.efi" ]; then
     }
 
     {
+        # Match Claude's original working 64-bit Visor menu configuration.
+        # Keep the flags, menu ordering and background unchanged: do not
+        # force graphics, logging, self-heal or resolution overrides here.
         printf '%s\n' "timeout=5" "default=0" "title=Alternix Installer"
         [ -n "$BG" ] && printf '%s\n' "$BG"
         entry "Install Alternix"                   "quiet"
+        if [ "$(cat ../chroot/etc/alternix/iso-mode 2>/dev/null)" = live-preview ]; then
+            entry "Try Alternix (Live)"           "alternix.live=1 quiet"
+        fi
         entry "Install Alternix (text mode)"       "alternix.tui=1 quiet"
         entry "Install Alternix (nomodeset)"       "nomodeset"
         entry "Install Alternix (safe mode, text)" "alternix.tui=1 noapic noacpi nomodeset"
@@ -1661,6 +2188,7 @@ if [ -f "$VISOR/visor_x64.efi" ]; then
                 "# A PE image with no initrd or cmdline is chainloaded." \
                 "entry {" \
                 "    name    = \"GRUB menu (fallback)\"" \
+                "    icon    = $FALLBACK_ICON" \
                 "    kernel  = $GRUB_BACKUP" \
                 "}"
         fi
@@ -1802,9 +2330,50 @@ if [[ ! -f "${BUILD_DIR}/live-image-amd64.hybrid.iso" ]] &&    ! find "${BUILD_D
     _die "live-build produced no ISO. Check ${LB_LOG}"
 fi
 
+# Repack oversized rootfs before the FAT32 and embedded EFI checks.
+_fat32_repack_squashfs
+
 # Verify both 32-bit UEFI entry points before calling this build successful.
 # In particular, EFI/BOOT on the ISO is not what dd-written media loads;
 # they read BOOTIA32.EFI from the embedded FAT boot image instead.
+# An ISO which takes hours to unpack on a small tablet must never ship.
+# Verify the actual squashfs header, not merely live-build's config values.
+_step "Verifying installer root filesystem"
+SQUASHFS="${BUILD_DIR}/binary/live/filesystem.squashfs"
+[[ -s "$SQUASHFS" ]] || _die "No live/filesystem.squashfs in built ISO."
+# Every SquashFS image must fit on FAT32, not merely the first image.
+# A module manifest is mandatory when additional layers exist.
+SQUASHFS_LAYERS=("$SQUASHFS")
+if [[ -s "${BUILD_DIR}/binary/live/filesystem.module" ]]; then
+    SQUASHFS_LAYERS=()
+    while IFS= read -r name || [[ -n "$name" ]]; do
+        [[ -z "$name" ]] && continue
+        [[ "$name" =~ ^filesystem(-[0-9]+)?\.squashfs$ ]] || _die "Unsafe squashfs module name: $name"
+        SQUASHFS_LAYERS+=("${BUILD_DIR}/binary/live/$name")
+    done < "${BUILD_DIR}/binary/live/filesystem.module"
+fi
+for LAYER in "${SQUASHFS_LAYERS[@]}"; do
+    [[ -s "$LAYER" ]] || _die "Missing SquashFS module: $LAYER"
+    (( $(stat -c %s "$LAYER") <= 4294967295 )) || \
+        _die "$(basename "$LAYER") exceeds FAT32's per-file limit."
+    unsquashfs -s "$LAYER" >/dev/null 2>&1 || _die "Invalid SquashFS module: $LAYER"
+done
+_ok "All ${#SQUASHFS_LAYERS[@]} SquashFS layer(s) fit on FAT32."
+SQUASHFS_INFO="$(unsquashfs -s "$SQUASHFS" 2>&1)" || _die "Cannot inspect live squashfs header."
+printf '%s\n' "$SQUASHFS_INFO" | grep -E 'Compression|Filesystem size' || true
+if ! printf '%s\n' "$SQUASHFS_INFO" | grep -Eiq "^Compression[[:space:]]+${LB_COMPRESSION_CHOICE}([[:space:]]|$)"; then
+    _die "ISO root filesystem uses unexpected compression; expected ${LB_COMPRESSION_CHOICE}."
+fi
+if [[ "$ALTERNIX_BUILD_MODE" == "live-preview" ]]; then
+    [[ -s "${BUILD_DIR}/chroot/etc/alternix/de-baked" ]] || \
+        _die "AlternixDE was not fully prebuilt for live-preview. See ${LB_LOG}"
+    _ok "Live rootfs has the prebuilt desktop and uses ${LB_COMPRESSION_CHOICE}."
+else
+    [[ ! -e "${BUILD_DIR}/chroot/etc/alternix/de-baked" ]] || \
+        _die "Net-install unexpectedly contains a prebuilt desktop marker."
+    _ok "Net-install rootfs has the graphical installer and uses ${LB_COMPRESSION_CHOICE}."
+fi
+
 _step "Verifying 32-bit UEFI boot files"
 EFI_TREE_FILE=$(find "${BUILD_DIR}/binary/EFI" -type f -iname bootia32.efi -print -quit 2>/dev/null)
 [[ -n "$EFI_TREE_FILE" && -s "$EFI_TREE_FILE" ]] || \
@@ -1835,7 +2404,7 @@ EFI_STAGE_EXPECTED="$EFI_TREE_FILE"
 # Visor checks include large files copied back from FAT32. Announce them
 # before the first mcopy, otherwise the builder looks idle for minutes.
 _step "Verifying 64-bit UEFI Visor boot files"
-_info "Checking the x64 EFI loader, boot.conf, kernel and initrd in the FAT32 image."
+_info "Checking the x64 EFI loader, boot.conf, icons, kernel and initrd in the FAT32 image."
 _info "Large initrd extraction can take several minutes; progress will appear every 15 seconds."
 
 # x64 Visor remains the default on extracted FAT USB media.
@@ -1872,14 +2441,22 @@ if [[ -s "$EFI_VISOR_PAYLOAD" ]]; then
     fi
     rm -rf "$VISOR_FAT_TMP"
     _ok "BOOTX64.EFI matches the Visor executable."
-    for boot_file in EFI/visor/boot.conf EFI/BOOT/grubx64-alternix.efi live/vmlinuz live/initrd.img; do
+    for boot_file in EFI/visor/boot.conf EFI/visor/icons/linux.png EFI/visor/icons/unknown.png EFI/BOOT/grubx64-alternix.efi live/vmlinuz live/initrd.img; do
         if ! mdir -i "$EFI_IMG" "::/$boot_file" >/dev/null 2>&1; then
             _die "Embedded FAT boot image is missing $boot_file for x64 Visor."
         fi
     done
     # Presence is not enough: compare the config and large payload files.
     # A partial FAT copy must not produce an allegedly bootable ISO.
-    for entry in         "EFI/visor/boot.conf|${BUILD_DIR}/binary/EFI/visor/boot.conf"         "live/vmlinuz|${BUILD_DIR}/binary/live/vmlinuz"         "live/initrd.img|${BUILD_DIR}/binary/live/initrd.img"; do
+    # Check the actual FAT boot partition, not only the ISO9660 tree:
+    # UEFI reads this partition directly on DD-written USB media.
+    # Icon files are small; comparing their bytes costs negligible time.
+    for entry in \
+        "EFI/visor/boot.conf|${BUILD_DIR}/binary/EFI/visor/boot.conf" \
+        "EFI/visor/icons/linux.png|${BUILD_DIR}/binary/EFI/visor/icons/linux.png" \
+        "EFI/visor/icons/unknown.png|${BUILD_DIR}/binary/EFI/visor/icons/unknown.png" \
+        "live/vmlinuz|${BUILD_DIR}/binary/live/vmlinuz" \
+        "live/initrd.img|${BUILD_DIR}/binary/live/initrd.img"; do
         boot_file=${entry%%|*}
         expected=${entry#*|}
         if [[ ! -s "$expected" ]]; then
@@ -1905,7 +2482,7 @@ if [[ -s "$EFI_VISOR_PAYLOAD" ]]; then
         rm -rf "$compare_tmp"
         _ok "$boot_file matches the ISO filesystem."
     done
-    _ok "64-bit UEFI: Visor, configuration, kernel and initrd verified in embedded FAT boot image."
+    _ok "64-bit UEFI: Visor, configuration, PNG icons, kernel and initrd verified in embedded FAT boot image."
 else
     _info "WARNING: Visor build unavailable; x64 UEFI uses live-build GRUB fallback."
 fi
@@ -1949,95 +2526,7 @@ if [[ -d "$BIN_LIVE" ]] && [[ ! -f "${BIN_LIVE}/vmlinuz" ]]; then
     fi
 fi
 
-# live-build's iso-hybrid image is already hybrid. DO NOT pass it to
-# syslinux isohybrid again: that tool rewrites the image system area and
-# partition data, potentially changing the EFI metadata used by tablets.
-_step "Preserving live-build EFI boot metadata"
-_info "Keeping live-build's xorriso hybrid partition tables unchanged."
-FOUND_ISO_TEMP=$(find "${BUILD_DIR}" -maxdepth 1 -name "*.iso" -print -quit)
-[[ -s "$FOUND_ISO_TEMP" ]] || _die "No ISO found for boot metadata verification."
-if ! xorriso -indev "$FOUND_ISO_TEMP" -report_el_torito plain -report_system_area plain \
-       > "${BUILD_DIR}/iso-boot-report.txt" 2>&1; then
-    _die "xorriso cannot read the generated ISO's boot metadata."
-fi
-if ! grep -Eq 'El Torito boot img.*UEFI' "${BUILD_DIR}/iso-boot-report.txt"; then
-    _die "Generated ISO has no El Torito UEFI boot image. Check iso-boot-report.txt."
-fi
-# Validate the FINISHED ISO, not just live-build's intermediate binary/
-# directory. A rebuilt efi.img in binary/ is irrelevant if the final ISO
-# retained the old FAT image. Check the final ISO's boot image byte-for-byte
-# and the IA32 executable inside it; also verify the file-copied USB path.
-EFI_CHECK_TMP=$(mktemp -d)
-if ! xorriso -osirrox on -indev "$FOUND_ISO_TEMP" \
-       -extract /boot/grub/efi.img "$EFI_CHECK_TMP/efi.img" >/dev/null 2>&1; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Finished ISO lacks the embedded EFI boot image."
-fi
-if ! cmp -s "$EFI_CHECK_TMP/efi.img" "$EFI_IMG"; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Finished ISO embeds a stale EFI image; IA32 boot would fail on DD-written USB."
-fi
-if [[ "$(dd if="$EFI_CHECK_TMP/efi.img" bs=1 skip=82 count=8 2>/dev/null)" != 'FAT32   ' ]]; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Finished ISO's embedded EFI image is not FAT32."
-fi
-if ! mdir -i "$EFI_CHECK_TMP/efi.img" ::/EFI/BOOT/BOOTX64.EFI >/dev/null 2>&1; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Finished ISO's embedded EFI image lost the x64 loader."
-fi
-if ! mcopy -o -i "$EFI_CHECK_TMP/efi.img" ::/EFI/BOOT/BOOTIA32.EFI \
-        "$EFI_CHECK_TMP/from-fat32.efi" >/dev/null 2>&1; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Finished ISO's embedded FAT32 image has no IA32 GRUB loader."
-fi
-if ! xorriso -osirrox on -indev "$FOUND_ISO_TEMP" \
-       -extract /EFI/BOOT/BOOTIA32.EFI \
-       "$EFI_CHECK_TMP/from-iso.efi" >/dev/null 2>&1; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Finished ISO has no EFI/BOOT/BOOTIA32.EFI for FAT32-extracted USB media."
-fi
-if ! cmp -s "$EFI_CHECK_TMP/from-fat32.efi" "$EFI_STAGE_EXPECTED"; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Final FAT32 IA32 GRUB does not match generated loader."
-fi
-if ! cmp -s "$EFI_CHECK_TMP/from-iso.efi" "$EFI_STAGE_EXPECTED"; then
-    rm -rf "$EFI_CHECK_TMP"
-    _die "Final ISO filesystem IA32 GRUB does not match generated loader."
-fi
-rm -rf "$EFI_CHECK_TMP"
-_ok "Final ISO: IA32 GRUB matches in ISO filesystem and embedded FAT32 ESP."
-
-# ── Copy output ───────────────────────────────────────────────────
-_step "Finalising"
-
-FOUND_ISO=$(find "${BUILD_DIR}" -name "*.hybrid.iso" | head -1)
-if [[ -z "$FOUND_ISO" ]]; then
-    FOUND_ISO=$(find "${BUILD_DIR}" -name "*.iso" | head -1)
-fi
-
-if [[ -z "$FOUND_ISO" ]]; then
-    _die "ISO not found in build output."
-fi
-
-_info "Writing finished ISO ($(du -h "$FOUND_ISO" | cut -f1)) to ${OUTPUT_ISO}..."
-if ! _monitored_cmd "Copying final ISO" cp --reflink=auto "$FOUND_ISO" "$OUTPUT_ISO"; then
-    _die "Failed to copy finished ISO to ${OUTPUT_ISO}. Check available disk space."
-fi
-[[ -s "$OUTPUT_ISO" ]] || _die "Output ISO is empty after copying."
-_ok "ISO written: ${OUTPUT_ISO}"
-
-SIZE=$(du -sh "$OUTPUT_ISO" | cut -f1)
-echo ""
-echo "  ══════════════════════════════════════════"
-echo "  Alternix Installer ISO built successfully"
-echo "  Output: ${OUTPUT_ISO}"
-echo "  Size:   ${SIZE}"
-echo "  ══════════════════════════════════════════"
-echo ""
-echo "  Boot defaults: 64-bit UEFI -> Visor, 32-bit UEFI -> GRUB text menu."
-echo "  IA32 GRUB is included automatically in both boot layouts."
-echo ""
-echo "  Write to USB:"
-echo "    sudo dd if=${OUTPUT_ISO} of=/dev/sdX bs=4M status=progress"
-echo "    sudo sync"
-echo ""
+# live-build's hybrid partition tables are already correct. Finalise by
+# verifying both loaders in the finished ISO using the exact Rock Ridge
+# path spellings and byte-comparing the embedded FAT32 image.
+_finalize_iso

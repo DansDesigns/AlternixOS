@@ -24,17 +24,18 @@
 #    --install itself, the call no longer matches and goes straight
 #    through unchanged.
 #
-# 2. rc-service  (in /usr/local/sbin, first on sudo's secure_path)
-#    `sudo auto-cpufreq --install` registers its OpenRC service and then
-#    starts it straight away. Inside a chroot OpenRC refuses: openrc-run
-#    exits 1 with "You are attempting to run an openrc service on a
-#    system which openrc did not boot", because /run/openrc/softlevel
-#    only exists on a booted system. That failure also propagates and
-#    ends the desktop build. Registration (rc-update add) still runs
-#    for real, so the service starts on the first real boot; only the
-#    immediate start/restart is skipped. sudo resets PATH to its
-#    secure_path, so this wrapper has to live in /usr/local/sbin rather
-#    than in SHIM_DIR.
+# 2. sudo auto-cpufreq --install (in SHIM_DIR)
+#    auto-cpufreq itself checks /sys CPU frequency governors before
+#    registering its daemon. In an ISO/target chroot those governors are
+#    not necessarily exposed, so the command exits 1 even AFTER the
+#    application successfully installs. Instead copy the upstream OpenRC
+#    service file and enable it via rc-update (which works in a chroot).
+#    The actual daemon starts only after boot on real hardware. This
+#    preserves auto-cpufreq in the prebuilt OS without a false failure.
+#
+# 3. rc-service  (in /usr/local/sbin, first on sudo's secure_path)
+#    Some dependency installers attempt to start OpenRC services during
+#    the chroot build. Block only start/restart, not service enablement.
 # ═══════════════════════════════════════════════════════════════
 
 set -u
@@ -53,6 +54,26 @@ _add() {
 ${MARKER} — see installer/de-shims.sh. Removed after the build.
 if [ "\$#" -eq 1 ] && [ "\$1" = "./auto-cpufreq-installer" ]; then
     exec /usr/bin/sudo ./auto-cpufreq-installer --install
+fi
+# The application is installed, but checking CPU governors and starting
+# a daemon inside live-build's chroot cannot work reliably.
+if [ "\$#" -eq 2 ] && [ "\$1" = "auto-cpufreq" ] && [ "\$2" = "--install" ]; then
+    if [ ! -x /usr/local/bin/auto-cpufreq ]; then
+        echo "auto-cpufreq: executable missing after installation" >&2
+        exit 1
+    fi
+    src=/usr/local/share/auto-cpufreq/scripts/auto-cpufreq-openrc
+    if [ ! -f "\$src" ] && [ -f ./scripts/auto-cpufreq-openrc ]; then
+        src=./scripts/auto-cpufreq-openrc
+    fi
+    if [ ! -f "\$src" ]; then
+        echo "auto-cpufreq: upstream OpenRC service definition missing" >&2
+        exit 1
+    fi
+    echo "auto-cpufreq: installing OpenRC service (CPU checks deferred to real boot)"
+    /usr/bin/sudo install -m 0755 "\$src" /etc/init.d/auto-cpufreq || exit \$?
+    /usr/bin/sudo rc-update add auto-cpufreq default || exit \$?
+    exit 0
 fi
 exec /usr/bin/sudo "\$@"
 EOF

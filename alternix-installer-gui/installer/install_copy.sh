@@ -20,6 +20,7 @@ ALTERNIX_MOUNT="${ALTERNIX_MOUNT:-/mnt/alternix}"
 
 # Set by _find_squashfs, consumed by copy_rootfs.
 ALTERNIX_SQUASHFS=""
+ALTERNIX_SQUASHFS_IMAGES=()
 
 # ── Locate the rootfs image ───────────────────────────────────────
 _find_squashfs() {
@@ -34,10 +35,36 @@ _find_squashfs() {
         "${ALTERNIX_SQUASHFS_OVERRIDE:-/nonexistent}"
     )
 
-    local c
+    local c dir module line name
+    local -a names
     for c in "${candidates[@]}"; do
-        if [[ -f "$c" ]]; then
+        if [[ -s "$c" ]]; then
             ALTERNIX_SQUASHFS="$c"
+            ALTERNIX_SQUASHFS_IMAGES=("$c")
+            dir="$(dirname "$c")"
+            module="$dir/filesystem.module"
+            if [[ -f "$module" ]]; then
+                ALTERNIX_SQUASHFS_IMAGES=()
+                # The builder writes one basename per line. Validate paths
+                # and check all layers BEFORE allowing partitioning/erase.
+                while IFS= read -r line || [[ -n "$line" ]]; do
+                    line="${line%%#*}"
+                    read -ra names <<< "$line"
+                    for name in "${names[@]}"; do
+                        [[ "$name" =~ ^filesystem(-[0-9]+)?\.squashfs$ ]] || return 1
+                        [[ -s "$dir/$name" ]] || return 1
+                        ALTERNIX_SQUASHFS_IMAGES+=("$dir/$name")
+                    done
+                done < "$module"
+                (( ${#ALTERNIX_SQUASHFS_IMAGES[@]} > 0 )) || return 1
+                [[ "${ALTERNIX_SQUASHFS_IMAGES[0]}" == "$c" ]] || return 1
+            else
+                # If additional layers somehow exist without their module
+                # list, the live filesystem would be incomplete. Refuse it.
+                if compgen -G "$dir/filesystem-[0-9]*.squashfs" >/dev/null; then
+                    return 1
+                fi
+            fi
             return 0
         fi
     done
@@ -65,16 +92,19 @@ copy_rootfs() {
         die "${ALTERNIX_MOUNT} is not a mountpoint. Refusing to unpack into the live overlay."
     fi
 
-    local img_bytes avail_bytes need_bytes
-    img_bytes=$(unsquashfs -s "$ALTERNIX_SQUASHFS" 2>/dev/null | \
-        awk '/Filesystem size/ {print $3}' | head -1)
-    # unsquashfs reports the *compressed* size; the unpacked tree is
-    # larger. 2.6x is a conservative multiplier for zstd at this ratio.
-    if [[ -n "$img_bytes" ]]; then
-        need_bytes=$(awk -v b="$img_bytes" 'BEGIN{printf "%.0f", b * 2.6}')
-    else
-        need_bytes=0
-    fi
+    local img_bytes avail_bytes need_bytes image image_bytes
+    img_bytes=0
+    # All layers combine into ONE installed rootfs. Count every layer in
+    # the free-space check rather than checking only filesystem.squashfs.
+    # Use stat in BYTES: unsquashfs -s reports its size in Kbytes and
+    # treating that number as bytes would undercount target space 1024x.
+    for image in "${ALTERNIX_SQUASHFS_IMAGES[@]}"; do
+        image_bytes=$(stat -c %s "$image") || die "Cannot measure squashfs image: $image"
+        img_bytes=$((img_bytes + image_bytes))
+    done
+    # unsquashfs reports the compressed size; 2.6x is the conservative
+    # preexisting sizing margin for the decompressed target filesystem.
+    need_bytes=$(awk -v b="$img_bytes" 'BEGIN{printf "%.0f", b * 2.6}')
     avail_bytes=$(df -B1 --output=avail "$ALTERNIX_MOUNT" 2>/dev/null | tail -1)
 
     if [[ -n "$avail_bytes" && "$need_bytes" -gt 0 ]] 2>/dev/null; then
@@ -83,7 +113,7 @@ copy_rootfs() {
         fi
     fi
 
-    info "Image: ${ALTERNIX_SQUASHFS}"
+    info "Rootfs: ${#ALTERNIX_SQUASHFS_IMAGES[@]} image layer(s), starting with ${ALTERNIX_SQUASHFS}"
 
     # Decompression is the bottleneck, so use every core. unsquashfs
     # already defaults to nproc, but be explicit — some builds default
@@ -110,39 +140,46 @@ copy_rootfs() {
     # unsquashfs redraws its progress bar with carriage returns and no
     # newline, so awk would see one enormous line and print nothing
     # until the unpack finished. tr converts CR to LF to break it up.
-    local rc=0
-    if [[ "${ALTERNIX_UNATTENDED:-0}" -eq 1 ]]; then
-        set -o pipefail
-        unsquashfs -f -d "$ALTERNIX_MOUNT" -p "$jobs" "$ALTERNIX_SQUASHFS" 2>&1 | \
-            tr '\r' '\n' | \
-            awk '
-                {
-                    if (match($0, /[0-9]+%/)) {
-                        pct = substr($0, RSTART, RLENGTH - 1)
-                        if (pct != last) {
-                            print "##COPY:" pct
-                            fflush()
-                            last = pct
+    local rc=0 layer_index=0 layer_count=${#ALTERNIX_SQUASHFS_IMAGES[@]}
+    for image in "${ALTERNIX_SQUASHFS_IMAGES[@]}"; do
+        info "Unpacking layer $((layer_index + 1))/${layer_count}: $(basename "$image")"
+        if [[ "${ALTERNIX_UNATTENDED:-0}" -eq 1 ]]; then
+            set -o pipefail
+            unsquashfs -f -d "$ALTERNIX_MOUNT" -p "$jobs" "$image" 2>&1 | \
+                tr '\r' '\n' | \
+                awk -v i="$layer_index" -v total="$layer_count" '
+                    {
+                        if (match($0, /[0-9]+%/)) {
+                            pct = substr($0, RSTART, RLENGTH - 1)
+                            combined = int((i * 100 + pct) / total)
+                            if (combined != last) {
+                                print "##COPY:" combined
+                                fflush()
+                                last = combined
+                            }
+                            next
                         }
-                        next
+                        print
+                        fflush()
                     }
-                    print
-                    fflush()
-                }
-            '
-        rc=${PIPESTATUS[0]}
-        set +o pipefail
-    else
-        spin_start "Unpacking system image..."
-        unsquashfs -f -d "$ALTERNIX_MOUNT" -p "$jobs" "$ALTERNIX_SQUASHFS" \
-            >>"$ALTERNIX_LOG" 2>&1
-        rc=$?
-        spin_stop
-    fi
-
-    if [[ $rc -ne 0 ]]; then
-        die "unsquashfs failed (exit ${rc}). The install medium may be damaged."
-    fi
+                '
+            rc=${PIPESTATUS[0]}
+            set +o pipefail
+        else
+            spin_start "Unpacking system layer $((layer_index + 1))/${layer_count}..."
+            if unsquashfs -f -d "$ALTERNIX_MOUNT" -p "$jobs" "$image" \
+                    >>"$ALTERNIX_LOG" 2>&1; then
+                rc=0
+            else
+                rc=$?
+            fi
+            spin_stop
+        fi
+        if [[ $rc -ne 0 ]]; then
+            die "unsquashfs failed on $(basename "$image") (exit ${rc}). The install medium may be damaged."
+        fi
+        layer_index=$((layer_index + 1))
+    done
 
     # Sanity check: a truncated unpack is worse than a failed one,
     # because everything after this point appears to work.
@@ -406,7 +443,7 @@ DPkg::Use-Pty "false";
 // That is indistinguishable from a crash. With these set, a stalled
 // connection fails and is retried instead.
 //
-// nala reads apt's configuration for acquire settings, so this covers
+// APT reads these acquire settings, so this covers
 // the AlternixDE package install as well as plain apt.
 Acquire::http::Timeout "30";
 Acquire::https::Timeout "30";

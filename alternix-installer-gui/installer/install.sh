@@ -343,10 +343,20 @@ show_hardware
 banner
 progress_set 1 "Network"
 banner
-setup_network
-
-# Fix wrong RTC before any TLS (git/apt) — see net_sync_clock
-net_sync_clock
+# A graphical install of the prebuilt Alternix image needs neither a
+# network scan nor online time-sync. The GUI can set up Wi-Fi separately;
+# installed NetworkManager lets the user connect after first boot.
+# Other desktops and selected optional network components retain networking.
+if [[ "${ALTERNIX_UNATTENDED:-0}" -eq 1 && \
+      "${ALTERNIX_DESKTOP:-}" == alternix && \
+      -s /etc/alternix/de-baked && \
+      -z "${ALTERNIX_OPTIONAL:-}" ]]; then
+    info "Prebuilt image install: skipping unnecessary network downloads and scanning."
+else
+    setup_network
+    # Fix wrong RTC before any TLS (git/apt) — see net_sync_clock
+    net_sync_clock
+fi
 
 # ════════════════════════════════════════════════════════════════
 # STAGE 4: Gather config (user + disk preferences)
@@ -367,6 +377,56 @@ banner
 # the first two minutes. install_desktop still runs at stage 9b.
 # ════════════════════════════════════════════════════════════════
 select_desktop
+
+# PRE-ERASE GUARD — both build profiles are explicit. The live-preview
+# MUST contain a complete desktop, while net-install deliberately does not.
+# For net-install check GitHub *before* changing the disk, since the
+# selected desktop is downloaded and built on the target from Git.
+ALTERNIX_ISO_MODE=$(cat /etc/alternix/iso-mode 2>/dev/null || echo live-preview)
+if [[ "${ALTERNIX_DESKTOP:-}" == "alternix" && "${ALTERNIX_FORCE_DEBOOTSTRAP:-0}" != 1 ]]; then
+    _find_squashfs || die "No bundled live rootfs: refusing to erase the target disk. Rebuild the ISO."
+    case "$ALTERNIX_ISO_MODE" in
+        live-preview)
+            if [[ ! -s /etc/alternix/de-baked || -f /etc/alternix/de-missing ]] || \
+               [[ ! -x /usr/local/bin/osm-launcher ]]; then
+                die "Live-preview desktop was not fully prebuilt. Refusing to erase the disk."
+            fi
+            ALTERNIX_PREBUILT_INSTALL=1
+            info "Prebuilt AlternixDE detected: installation will copy the ready-to-run OS."
+            ;;
+        net-install)
+            info "Net-install: AlternixDE will be cloned from GitHub after the base system is copied."
+            if ! timeout 60 git -c credential.interactive=never ls-remote --exit-code \
+                https://github.com/DansDesigns/AlternixDE.git HEAD >/dev/null 2>&1; then
+                die "AlternixDE GitHub repository is unreachable. Connect to the internet before erasing the disk."
+            fi
+            ;;
+        *) die "Unknown ISO build mode: ${ALTERNIX_ISO_MODE}" ;;
+    esac
+fi
+
+# Prevent starting a destructive installation on a nearly exhausted tablet.
+# Firmware without usable power_supply sysfs readings is unaffected.
+_check_tablet_battery_before_erase() {
+    _scan_power_supplies
+    # If firmware fails to expose battery capacity, do not mistake a USB
+    # accessory for mains or invent a battery percentage.
+    if (( HW_BATTERY_FOUND )) && [[ -z "$HW_BATTERY_PCT" ]]; then
+        warn "Battery detected but firmware does not expose its charge level; check power before installing."
+        return
+    fi
+    if (( HW_BATTERY_FOUND )) && [[ -n "$HW_BATTERY_PCT" ]] &&
+       (( ! HW_CHARGING && ! HW_MAINS_ONLINE )); then
+        if (( HW_BATTERY_PCT < 50 )); then
+            die "Battery is ${HW_BATTERY_PCT}% with no charger detected. Connect power or charge to at least 50% before erasing the disk."
+        fi
+        if (( HW_BATTERY_PCT < 75 )); then
+            warn "Battery is ${HW_BATTERY_PCT}% and no charger is detected. Please connect external power before installing."
+        fi
+    fi
+}
+
+_check_tablet_battery_before_erase
 
 # ════════════════════════════════════════════════════════════════
 # STAGE 5: Disk
@@ -426,16 +486,20 @@ configure_system
 # ════════════════════════════════════════════════════════════════
 progress_set 8 "Desktop"
 banner
-# DE MARKER CHECK — DO NOT REMOVE
-# hook 0080 writes /etc/alternix/de-missing into the image when the
-# AlternixDE build failed at ISO build time. Without this check the
-# copy install would assume the desktop is already there and skip
-# install_desktop, leaving a system with no desktop at all.
-if [[ -f "${ALTERNIX_MOUNT}/etc/alternix/de-missing" ]]; then
-    warn "System image has no baked desktop — building it on the target."
-    ALTERNIX_DE_BAKED=0
-else
+# Verify the positive prebuilt marker on the copied target, not merely
+# the absence of an old failure marker. The copy installation must not
+# silently rebuild the desktop on a battery-powered tablet.
+if [[ -s "${ALTERNIX_MOUNT}/etc/alternix/de-baked" && \
+      ! -f "${ALTERNIX_MOUNT}/etc/alternix/de-missing" ]]; then
     ALTERNIX_DE_BAKED=1
+else
+    ALTERNIX_DE_BAKED=0
+fi
+if [[ "${ALTERNIX_COPY_INSTALL:-0}" -eq 1 && \
+      "${ALTERNIX_DESKTOP:-}" == "alternix" && \
+      "${ALTERNIX_ISO_MODE:-live-preview}" == "live-preview" && \
+      "${ALTERNIX_DE_BAKED}" -ne 1 ]]; then
+    die "Copied live-preview rootfs is missing the prebuilt Alternix desktop marker."
 fi
 
 if [[ "${ALTERNIX_COPY_INSTALL:-0}" -eq 1 && "${ALTERNIX_DE_BAKED}" -eq 1 && "${ALTERNIX_DESKTOP:-}" == "alternix" ]]; then
@@ -444,7 +508,9 @@ if [[ "${ALTERNIX_COPY_INSTALL:-0}" -eq 1 && "${ALTERNIX_DE_BAKED}" -eq 1 && "${
     # 41 g++ runs on the target CPU for no gain.
     info "AlternixDE already present from the system image."
 else
-    install_desktop
+    if ! install_desktop; then
+        die "Desktop installation failed. Check ${ALTERNIX_LOG}; the installed system is incomplete."
+    fi
 fi
 
 # On-screen keyboard defaults, for both the baked and the built

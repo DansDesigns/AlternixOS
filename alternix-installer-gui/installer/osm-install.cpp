@@ -277,6 +277,93 @@ static QString readFileTrimmed(const QString &path) {
     return QString::fromUtf8(f.readAll()).trimmed();
 }
 
+// Enumerate power_supply by its sysfs properties rather than BAT* names.
+// Linx/Atom tablets can expose batteries as axp288_fuel_gauge, bq27xxx,
+// or other vendor-specific names; a USB hub must not imply mains power.
+struct PowerSnapshot {
+    bool hasBattery = false;
+    bool hasPercent = false;
+    bool mainsOnline = false;
+    int percent = 101;                    // lowest detected battery percentage
+    QString status;
+};
+
+static PowerSnapshot scanPowerSupplies(const QString &root =
+                                      QStringLiteral("/sys/class/power_supply")) {
+    PowerSnapshot result;
+    QDir d(root);
+    const QStringList entries = d.entryList(
+        QDir::Dirs | QDir::NoDotAndDotDot | QDir::System);
+    for (const QString &entry : entries) {
+        const QString base = d.absoluteFilePath(entry);
+        QString type = readFileTrimmed(base + QStringLiteral("/type")).toLower();
+        if (type.isEmpty()) {
+            const QString uevent = readFileTrimmed(base + QStringLiteral("/uevent"));
+            for (const QString &line : uevent.split('\n')) {
+                if (line.startsWith(QStringLiteral("POWER_SUPPLY_TYPE="))) {
+                    type = line.mid(18).trimmed().toLower();
+                    break;
+                }
+            }
+        }
+        if (type == QStringLiteral("mains")) {
+            if (readFileTrimmed(base + QStringLiteral("/online")) ==
+                QStringLiteral("1")) result.mainsOnline = true;
+            continue;
+        }
+        // Online USB devices can be data hubs, not chargers.
+        if (type == QStringLiteral("usb") || type.startsWith(QStringLiteral("usb_")) ||
+            type == QStringLiteral("wireless")) continue;
+        if (readFileTrimmed(base + QStringLiteral("/present")) ==
+            QStringLiteral("0")) continue;
+
+        const QString status = readFileTrimmed(base + QStringLiteral("/status"));
+        const QString capacity = readFileTrimmed(base + QStringLiteral("/capacity"));
+        bool valid = false;
+        int pct = capacity.toInt(&valid);
+        valid = valid && pct >= 0 && pct <= 100;
+        const bool hasCounters =
+            (QFile::exists(base + QStringLiteral("/energy_now")) &&
+             QFile::exists(base + QStringLiteral("/energy_full"))) ||
+            (QFile::exists(base + QStringLiteral("/charge_now")) &&
+             QFile::exists(base + QStringLiteral("/charge_full")));
+        const QString lowerName = entry.toLower();
+        const bool knownBattery = type == QStringLiteral("battery");
+        const bool fallbackBattery = (type.isEmpty() || type == QStringLiteral("unknown")) &&
+            ((valid && !status.isEmpty()) || hasCounters ||
+             ((lowerName.contains(QStringLiteral("battery")) ||
+                lowerName.startsWith(QStringLiteral("bat")) ||
+                lowerName.contains(QStringLiteral("fuel_gauge"))) &&
+              (valid || !status.isEmpty())));
+        if (!knownBattery && !fallbackBattery) continue;
+        result.hasBattery = true;
+
+        if (!valid && hasCounters) {
+            for (const QString &kind : {QStringLiteral("energy"), QStringLiteral("charge")}) {
+                bool nowOk = false, fullOk = false;
+                const double now = readFileTrimmed(base + "/" + kind + "_now").toDouble(&nowOk);
+                const double full = readFileTrimmed(base + "/" + kind + "_full").toDouble(&fullOk);
+                if (nowOk && fullOk && now >= 0 && full > 0) {
+                    pct = qBound(0, qRound(now * 100.0 / full), 100);
+                    valid = true;
+                    break;
+                }
+            }
+        }
+        if (valid && (!result.hasPercent || pct < result.percent)) {
+            result.hasPercent = true;
+            result.percent = pct;
+            result.status = status;
+        } else if (result.status.isEmpty()) {
+            result.status = status;
+        }
+    }
+    if (result.status.compare(QStringLiteral("Discharging"),
+                              Qt::CaseInsensitive) == 0)
+        result.mainsOnline = false;
+    return result;
+}
+
 // Single-quote a value for a shell config file.
 static QString shQuote(const QString &v) {
     QString s = v;
@@ -623,24 +710,23 @@ private:
         m_clock->setText(QTime::currentTime().toString(QStringLiteral("HH:mm")));
         refreshNetwork();
 
-        QDir d("/sys/class/power_supply");
-        const QStringList bats =
-            d.entryList(QStringList() << "BAT*", QDir::Dirs | QDir::NoDotAndDotDot);
-        if (bats.isEmpty()) {
-            m_battery->setText(QString::fromUtf8("\u26a1  AC"));
-            stylePill(m_battery, FG_DIM);
+        const PowerSnapshot power = scanPowerSupplies();
+        if (!power.hasBattery) {
+            // Some tablet USB/OTG hubs expose a misleading mains supply.
+            // Without a real battery reading, do not present that as
+            // confirmed charging (or claim the tablet has no battery).
+            m_battery->setText(QStringLiteral("Battery ?"));
+            stylePill(m_battery, "#d9a34f");
             return;
         }
-        const QString base = d.absoluteFilePath(bats.first());
-        const QString cap  = readFileTrimmed(base + "/capacity");
-        const QString st   = readFileTrimmed(base + "/status");
-        if (cap.isEmpty()) {
-            m_battery->setText(QStringLiteral("Battery"));
+        if (!power.hasPercent) {
+            m_battery->setText(QStringLiteral("Battery ?"));
+            stylePill(m_battery, "#d9a34f");
             return;
         }
-        const int pct = cap.toInt();
-        const bool charging = st.contains(QStringLiteral("Charging"),
-                                          Qt::CaseInsensitive);
+        const int pct = power.percent;
+        const bool charging = power.status.compare(QStringLiteral("Charging"),
+                                                   Qt::CaseInsensitive) == 0;
         m_battery->setText(QString("%1%2%")
                                .arg(charging ? QStringLiteral("\u26a1 ") : QString())
                                .arg(pct));
@@ -871,14 +957,12 @@ private:
     }
 
     static QString battery() {
-        QDir d("/sys/class/power_supply");
-        const QStringList entries = d.entryList(QStringList() << "BAT*", QDir::Dirs);
-        if (entries.isEmpty()) return QStringLiteral("None (mains powered)");
-        const QString base = d.absoluteFilePath(entries.first());
-        const QString cap  = readFileTrimmed(base + "/capacity");
-        const QString st   = readFileTrimmed(base + "/status");
-        if (cap.isEmpty()) return QStringLiteral("Present");
-        return cap + "%  " + (st.isEmpty() ? QString() : st);
+        const PowerSnapshot power = scanPowerSupplies();
+        if (!power.hasBattery)
+            return QStringLiteral("Not detected (check battery driver)");
+        if (!power.hasPercent) return QStringLiteral("Present (charge unknown)");
+        return QString::number(power.percent) + QStringLiteral("%  ") +
+               (power.status.isEmpty() ? QStringLiteral("Status unknown") : power.status);
     }
 
     ClickableCard *m_card = nullptr;
@@ -1510,7 +1594,7 @@ public:
 
         struct Item { const char *id; const char *name; const char *desc; };
         static const Item items[] = {
-            {"alternix", "Alternix",  "The native Alternix desktop. Built from source."},
+            {"alternix", "Alternix",  "Native Alternix desktop, prebuilt on the ISO."},
             {"xfce",     "XFCE",      "Lightweight and traditional."},
             {"lxqt",     "LXQt",      "Lightweight, Qt based."},
             {"lxde",     "LXDE",      "Very lightweight, GTK2."},
@@ -1519,13 +1603,19 @@ public:
             {"cli",      "No desktop", "Terminal only. No display server."}
         };
 
+        const bool netInstall = readFileTrimmed(
+            QStringLiteral("/etc/alternix/iso-mode")) == QStringLiteral("net-install");
         for (const Item &it : items) {
             ClickableCard *card = new ClickableCard;
             QVBoxLayout *cv = new QVBoxLayout(card);
             cv->setContentsMargins(18, 14, 18, 14);
             cv->setSpacing(4);
             cv->addWidget(mkLabel(QString::fromUtf8(it.name), 19, FG, true));
-            cv->addWidget(mkLabel(QString::fromUtf8(it.desc), 15, FG_DIM));
+            const QString detail = (netInstall && QString::fromUtf8(it.id) ==
+                QStringLiteral("alternix"))
+                ? QStringLiteral("Downloaded from GitHub during installation (internet required).")
+                : QString::fromUtf8(it.desc);
+            cv->addWidget(mkLabel(detail, 15, FG_DIM));
 
             const QString id = QString::fromUtf8(it.id);
             card->setOnClick([this, card, id]() {

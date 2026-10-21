@@ -42,6 +42,108 @@ detect_hardware() {
     detect_network_hardware
 }
 
+# Power-supply detection shared by the text display and pre-erase guard.
+# Firmware on tablets often uses names like axp288_fuel_gauge, bq27xxx-0,
+# or intel-battery rather than BAT0; sysfs "type" is authoritative.
+# If the kernel does not expose a battery device, do NOT assume AC power:
+# a USB hub/network dongle can be connected without charging the tablet.
+HW_BATTERY_FOUND=0
+HW_BATTERY_PCT=""
+HW_BATTERY_STATUS=""
+HW_MAINS_ONLINE=0
+HW_CHARGING=0
+
+_scan_power_supplies() {
+    local root="${1:-/sys/class/power_supply}"
+    local supply typ name present status pct now full online raw
+    local battery=0
+    HW_BATTERY_FOUND=0
+    HW_BATTERY_PCT=""
+    HW_BATTERY_STATUS=""
+    HW_MAINS_ONLINE=0
+    HW_CHARGING=0
+
+    for supply in "$root"/*; do
+        [[ -d "$supply" ]] || continue  # sysfs devices are usually symlinks
+        typ=""; status=""; pct=""; present=""; online=""
+        [[ -r "$supply/type" ]] && IFS= read -r typ < "$supply/type"
+        if [[ -z "$typ" && -r "$supply/uevent" ]]; then
+            raw=$(grep -m1 '^POWER_SUPPLY_TYPE=' "$supply/uevent" 2>/dev/null || true)
+            typ=${raw#POWER_SUPPLY_TYPE=}
+        fi
+        typ=${typ,,}
+        name=${supply##*/}; name=${name,,}
+
+        if [[ "$typ" == mains ]]; then
+            [[ -r "$supply/online" ]] && IFS= read -r online < "$supply/online"
+            [[ "$online" == 1 ]] && HW_MAINS_ONLINE=1
+            continue
+        fi
+        # USB/USB-C 'online' alone is NOT proof of a wall charger. The
+        # kernel may report a connected data hub or peripheral as online.
+        case "$typ" in
+            usb|usb_*|wireless) continue ;;
+        esac
+        [[ -r "$supply/present" ]] && IFS= read -r present < "$supply/present"
+        [[ "$present" == 0 ]] && continue
+
+        [[ -r "$supply/status" ]] && IFS= read -r status < "$supply/status"
+        [[ -r "$supply/capacity" ]] && IFS= read -r pct < "$supply/capacity"
+        [[ "$pct" =~ ^[0-9]+$ ]] && (( 10#$pct <= 100 )) || pct=""
+
+        battery=0
+        if [[ "$typ" == battery ]]; then
+            battery=1
+        elif [[ -z "$typ" || "$typ" == unknown ]]; then
+            # Fallback for incomplete firmware: require battery-like
+            # readings rather than trusting an arbitrary device name.
+            if [[ -n "$status" && -n "$pct" ]] ||
+               { [[ -r "$supply/energy_now" && -r "$supply/energy_full" ]] ||
+                 [[ -r "$supply/charge_now" && -r "$supply/charge_full" ]]; }; then
+                battery=1
+            elif [[ "$name" == *battery* || "$name" == bat[0-9]* ||
+                    "$name" == *fuel*gauge* ]] && [[ -n "$pct" || -n "$status" ]]; then
+                battery=1
+            fi
+        fi
+        (( battery )) || continue
+        HW_BATTERY_FOUND=1
+
+        if [[ -z "$pct" ]]; then
+            # Some tablets omit capacity but expose charge/energy counters.
+            for raw in energy charge; do
+                now=""; full=""
+                [[ -r "$supply/${raw}_now" ]] && IFS= read -r now < "$supply/${raw}_now"
+                [[ -r "$supply/${raw}_full" ]] && IFS= read -r full < "$supply/${raw}_full"
+                pct=$(awk -v n="$now" -v f="$full" 'BEGIN {
+                    if (n ~ /^[0-9]+$/ && f ~ /^[0-9]+$/ && f > 0) {
+                        p=int(n*100/f+0.5); if (p>100) p=100; print p
+                    }
+                }')
+                [[ -n "$pct" ]] && break
+            done
+        fi
+
+        # Keep the LOWEST percentage across multiple battery packs.
+        # An unknown capacity never erases a valid earlier reading.
+        if [[ -n "$pct" ]] && { [[ -z "$HW_BATTERY_PCT" ]] ||
+           (( pct < HW_BATTERY_PCT )); }; then
+            HW_BATTERY_PCT=$pct
+            HW_BATTERY_STATUS=$status
+        elif [[ -z "$HW_BATTERY_STATUS" ]]; then
+            HW_BATTERY_STATUS=$status
+        fi
+        [[ "${status,,}" == charging ]] && HW_CHARGING=1
+    done
+
+    # An explicitly discharging battery overrides ambiguous power reports.
+    # A real mains power supply can also make installation safe when the
+    # battery is intentionally not charging (e.g. charge threshold).
+    if [[ "${HW_BATTERY_STATUS,,}" == discharging ]]; then
+        HW_MAINS_ONLINE=0
+    fi
+}
+
 # ═══════════════════════════════════════════════════════════════
 # Network hardware detection — DO NOT REMOVE
 # Blindly installing every vendor's firmware package and hoping one of

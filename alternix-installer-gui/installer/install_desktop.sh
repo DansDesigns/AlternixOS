@@ -81,7 +81,7 @@ install_desktop() {
     # CHROOT SERVICE FIX (desktop stage) — DO NOT REMOVE
     # Package post-install scripts (invoke-rc.d -> rc-service) still
     # fail inside the chroot at this stage — rc-service only exists
-    # on a REAL boot. Any apt/nala install here (including inside
+    # on a REAL boot. Any APT package installation here (including inside
     # the Alternix installer, which runs under 'set -e') would abort
     # the entire desktop-install run on the very first package that
     # ships an init script. Divert invoke-rc.d for this whole stage;
@@ -100,18 +100,17 @@ exit 101
 PRCEOF
     chmod +x "${ALTERNIX_MOUNT}/usr/sbin/policy-rc.d"
 
+    local desktop_rc=0
     case "$ALTERNIX_DESKTOP" in
-        alternix) _install_alternix ;;
-        xfce)     _install_xfce ;;
-        lxqt)     _install_lxqt ;;
-        lxde)     _install_lxde ;;
-        mate)     _install_mate ;;
-        openbox)  _install_openbox ;;
-        cli)      _install_cli ;;
+        alternix) _install_alternix || desktop_rc=$? ;;
+        xfce)     _install_xfce || desktop_rc=$? ;;
+        lxqt)     _install_lxqt || desktop_rc=$? ;;
+        lxde)     _install_lxde || desktop_rc=$? ;;
+        mate)     _install_mate || desktop_rc=$? ;;
+        openbox)  _install_openbox || desktop_rc=$? ;;
+        cli)      _install_cli || desktop_rc=$? ;;
         *)        err "Unknown desktop value: '${ALTERNIX_DESKTOP}'"
-                  warn "Re-running desktop selection..."
-                  select_desktop
-                  install_desktop ;;
+                  desktop_rc=1 ;;
     esac
 
     # Repair anything left half-configured, then restore invoke-rc.d
@@ -125,6 +124,7 @@ PRCEOF
     for fs in dev/pts dev sys proc; do
         umount "${ALTERNIX_MOUNT}/${fs}" 2>/dev/null || true
     done
+    return "$desktop_rc"
 }
 
 # ── Shared X11 base ───────────────────────────────────────────────
@@ -178,7 +178,7 @@ _install_alternix() {
 
     # ═══════════════════════════════════════════════════════════
     # USE THE COPY ALREADY IN THE IMAGE IF THERE IS ONE
-    # Hook 0080 clones AlternixDE at ISO build time and leaves it at
+    # The ISO desktop prebuild stashes AlternixDE at
     # /usr/share/alternix/AlternixDE. Because the squashfs is what gets
     # copied onto the target, that directory is already on the target
     # disk. Cloning again from GitHub duplicates a download that has
@@ -216,6 +216,14 @@ _install_alternix() {
         return 1
     fi
     fi   # end: copy-from-image else clone
+    # Use the APT-only installer shipped with this ISO, just like the
+    # prebuilt desktop path. The source still comes from GitHub in net mode.
+    if [[ -s "${INSTALLER_DIR}/install-alternix_devuan.sh" ]]; then
+        cp -f "${INSTALLER_DIR}/install-alternix_devuan.sh" \
+            "${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}/Alternix/install-alternix_devuan.sh" || return 1
+        sed -i 's/\r$//' \
+            "${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}/Alternix/install-alternix_devuan.sh"
+    fi
     _chroot "chown -R ${ALTERNIX_USERNAME}:${ALTERNIX_USERNAME} /home/${ALTERNIX_USERNAME}/Alternix"
 
     # osm-sudo: make the GUI pattern-auth wrapper available system-wide,
@@ -481,7 +489,9 @@ XEOF
             echo "      ${l}"
         done
         warn "The full log is saved to the USB stick at the end of the install."
+        return "$alt_exit"
     fi
+    return 0
 }
 
 # ── XFCE ──────────────────────────────────────────────────────────
