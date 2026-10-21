@@ -75,13 +75,13 @@ sudo bash build-arm.sh
 # The generated files will be named alternix-net-install.iso and alternix-live-preview.iso,
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# net install:
+# net-install:
 
 cp ~/alternix-installer/alternix-net-install.iso /mnt/c/Users/dan/github/AlternixOS/alternix-net-install.iso
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# live preview: 
+# live-preview: 
 
 cp ~/alternix-installer/alternix-live-preview.iso /mnt/c/Users/dan/github/AlternixOS/alternix-live-preview.iso
 

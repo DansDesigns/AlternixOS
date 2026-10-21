@@ -82,185 +82,37 @@ _monitored_cmd() {  # label command args...
     fi
 }
 
-# ── FAT32-sized live rootfs layers ───────────────────────────────────
-# FAT32 can store a 4-GiB-less-one-byte file, not a 5+ GiB squashfs.
-# Split the *finished* live-build squashfs into genuine mountable layers,
-# then replay the ISO's hybrid BIOS/UEFI boot configuration. This keeps
-# Rufus ISO-mode FAT32 support without changing the desktop contents.
-# Live-boot overlays these in filesystem.module order; install_copy.sh
-# unpacks the same ordered images to install the exact complete system.
-_fat32_repack_squashfs() {
+# ── Single SquashFS for reliable live-boot ────────────────────────────
+# live-boot failed mounting the previous 9-way OverlayFS lowerdir stack on
+# real VirtualBox tests. Do not split filesystem.squashfs or generate a
+# filesystem.module: use the original image created by live-build.
+#
+# A live-preview SquashFS above 4 GiB is a VALID file on ISO9660, but Rufus
+# FAT32 **ISO extraction** cannot store it. For such images write the
+# ISO as a raw hybrid image (Rufus DD mode, USBImager, or `dd`). The EFI
+# system partition within the image is still FAT32. Net-install remains
+# small enough for conventional FAT32 ISO extraction.
+_verify_single_rootfs() {
     local live_dir="$BUILD_DIR/binary/live"
-    local source_img="$live_dir/filesystem.squashfs"
-    local original_iso="$BUILD_DIR/live-image-amd64.hybrid.iso"
-    local max_fat=4294967295
-    # Cap *uncompressed apparent* bytes per layer well below FAT32 max.
-    # Even incompressible files leave ample room for SquashFS metadata.
-    local max_layer_bytes=2684354560
-    local temp="$BUILD_DIR/.alternix-squashfs-split"
-    local extracted="$temp/extracted" stages="$temp/stages"
-    local whole="$temp/whole.squashfs"
-    local original_size name num=0 current_bytes=0
-    local item_size rel target stage stage_num file cpu_count
-    local rebuilt="$BUILD_DIR/.alternix-fat32-repacked.iso"
-    local -a layer_images=() xorriso_args=() children=()
-
-    [[ -s "$source_img" ]] || _die "Missing finished live root filesystem."
-    original_size=$(stat -c %s "$source_img")
-    if (( original_size <= max_fat )); then
-        _ok "Single squashfs fits FAT32 ($(du -h "$source_img" | cut -f1))."
-        return 0
+    local rootfs="$live_dir/filesystem.squashfs"
+    local rootfs_bytes
+    [[ -s "$rootfs" ]] || _die "Missing standard live/filesystem.squashfs."
+    if [[ -e "$live_dir/filesystem.module" ]] || \
+       compgen -G "$live_dir/filesystem-[0-9]*.squashfs" >/dev/null; then
+        _die "Refusing a layered live rootfs: live-boot failed to overlay these layers in VirtualBox. Rebuild from scratch."
     fi
-    [[ -s "$original_iso" ]] || _die "Missing completed hybrid ISO for FAT32 repacking."
-    [[ ! -e "$temp" ]] || _die "Stale $temp exists. Remove it after checking free space, then retry."
-    command -v mksquashfs >/dev/null || _die "mksquashfs required for large FAT32 images."
-    command -v unsquashfs >/dev/null || _die "unsquashfs required for large FAT32 images."
-    command -v xorriso >/dev/null || _die "xorriso required to preserve the ISO hybrid boot layout."
-
-    _step "Packing large live desktop into FAT32-safe SquashFS layers"
-    _info "Full squashfs is $(du -h "$source_img" | cut -f1); installed packages will not be removed."
-    _info "This operation needs extra temporary disk space for the unpacked rootfs."
-    mkdir -p "$extracted" "$stages"
-    # Work from the exact completed SquashFS, not the mutable build chroot.
-    # The root user's xattrs, symlinks, hardlinks, devices and all installed
-    # desktop files are thereby preserved from the bootable source image.
-    if ! unsquashfs -no-progress -d "$extracted" "$source_img" >"$temp/unpack.log" 2>&1; then
-        tail -25 "$temp/unpack.log" >&2 || true
-        _die "Could not extract the original SquashFS for FAT32 layering."
-    fi
-    if [[ "$ALTERNIX_BUILD_MODE" == "live-preview" ]]; then
-        [[ -s "$extracted/etc/alternix/de-baked" ]] || \
-            _die "Refusing to split a live-preview image without the prebuilt AlternixDE marker."
-    fi
-
-    # Partition the extracted filesystem by whole paths. Large directories
-    # are partitioned recursively; a layer never exceeds 2.5 GiB of raw
-    # apparent data. cp --link avoids storing duplicate copies of the
-    # 11+ GiB rootfs when creating layer staging trees on the same disk.
-    _fat32_add_item() {
-        local item="$1" bytes="$2" new_layer
-        if (( num == 0 || current_bytes + bytes > max_layer_bytes )); then
-            num=$((num + 1))
-            current_bytes=0
-            new_layer="$stages/$(printf '%02d' "$num")"
-            mkdir -p "$new_layer"
+    rootfs_bytes=$(stat -c %s "$rootfs") || _die "Could not stat live root filesystem."
+    unsquashfs -s "$rootfs" >/dev/null 2>&1 || _die "The live SquashFS image is corrupt."
+    if (( rootfs_bytes > 4294967295 )); then
+        if [[ "$ALTERNIX_BUILD_MODE" == net-install ]]; then
+            _die "Net-install rootfs exceeds FAT32's per-file limit; investigate unexpected packages."
         fi
-        target="$stages/$(printf '%02d' "$num")"
-        ( cd "$extracted" && cp -a --link --parents -- "$item" "$target/" ) || \
-            _die "Could not stage $item for SquashFS layer $num."
-        current_bytes=$((current_bytes + bytes))
-    }
-    _fat32_partition_dir() {
-        local path="$1" bytes="$2" child child_bytes
-        local -a entries=()
-        if (( bytes <= max_layer_bytes )); then
-            _fat32_add_item "$path" "$bytes"
-            return 0
-        fi
-        [[ -d "$extracted/$path" && ! -L "$extracted/$path" ]] || \
-            _die "A single file exceeds the safe FAT32 SquashFS layer limit: $path"
-        mapfile -d '' -t entries < <(find "$extracted/$path" -mindepth 1 -maxdepth 1 -print0 | sort -z)
-        (( ${#entries[@]} > 0 )) || _die "Cannot partition oversized empty directory: $path"
-        for child in "${entries[@]}"; do
-            child="${child#"$extracted/"}"
-            child_bytes=$(du -sb --apparent-size -- "$extracted/$child" | cut -f1) || \
-                _die "Cannot measure $child"
-            _fat32_partition_dir "$child" "$child_bytes"
-        done
-    }
-
-    mapfile -d '' -t children < <(find "$extracted" -mindepth 1 -maxdepth 1 -print0 | sort -z)
-    for rel in "${children[@]}"; do
-        rel="${rel#"$extracted/"}"
-        item_size=$(du -sb --apparent-size -- "$extracted/$rel" | cut -f1) || _die "Cannot measure $rel"
-        _fat32_partition_dir "$rel" "$item_size"
-    done
-    (( num >= 2 )) || _die "Rootfs splitting did not create at least two layers."
-
-    # The original ISO and binary/ tree remain intact until *every* layer
-    # has been built and validated. The manifest controls overlay ordering.
-    cpu_count=$(nproc 2>/dev/null || echo 2)
-    (( cpu_count > 8 )) && cpu_count=8
-    for ((stage_num=1; stage_num<=num; stage_num++)); do
-        if (( stage_num == 1 )); then name="filesystem.squashfs";
-        else name="filesystem-$(printf '%02d' "$stage_num").squashfs"; fi
-        file="$temp/$name"
-        stage="$stages/$(printf '%02d' "$stage_num")"
-        _info "Compressing live layer $stage_num/$num ($name)..."
-        if ! mksquashfs "$stage" "$file" -noappend -comp "$LB_COMPRESSION_CHOICE" \
-                -b 131072 -processors "$cpu_count" -no-progress >"$temp/pack-$stage_num.log" 2>&1; then
-            tail -25 "$temp/pack-$stage_num.log" >&2 || true
-            _die "Could not create $name."
-        fi
-        [[ -s "$file" ]] || _die "Empty squashfs layer: $name"
-        (( $(stat -c %s "$file") <= max_fat )) || \
-            _die "$name still exceeds FAT32 size cap."
-        unsquashfs -s "$file" >/dev/null 2>&1 || _die "Invalid squashfs layer $name"
-        layer_images+=("$file")
-        _ok "$name: $(du -h "$file" | cut -f1)"
-    done
-
-    # Build the module manifest before rewriting the ISO. Keep the first
-    # layer named filesystem.squashfs, matching old installer discovery.
-    : > "$temp/filesystem.module"
-    for file in "${layer_images[@]}"; do
-        printf '%s\n' "${file##*/}" >> "$temp/filesystem.module"
-    done
-    # Build checksums for the modified ISO contents, when live-build has
-    # generated a checksum manifest. Leave unrelated checksums unchanged.
-    if [[ -f "$BUILD_DIR/binary/md5sum.txt" ]]; then
-        grep -Ev '[[:space:]]+\*?\.?/?live/filesystem(-[0-9]+)?\.squashfs$|[[:space:]]+\*?\.?/?live/filesystem\.module$' \
-            "$BUILD_DIR/binary/md5sum.txt" >"$temp/md5sum.txt" || true
-        for file in "${layer_images[@]}"; do
-            printf '%s  live/%s\n' "$(md5sum "$file" | cut -d' ' -f1)" "${file##*/}" >>"$temp/md5sum.txt"
-        done
-        printf '%s  live/filesystem.module\n' "$(md5sum "$temp/filesystem.module" | cut -d' ' -f1)" >>"$temp/md5sum.txt"
+        _info "Live-preview has one $(du -h "$rootfs" | cut -f1) SquashFS."
+        _info "This exceeds FAT32's 4 GiB FILE limit. Use Rufus DD/raw image mode, NOT ISO extraction mode."
+        _info "The embedded EFI boot partition remains FAT32 for UEFI firmware."
+    else
+        _ok "Single live SquashFS fits FAT32 ($(du -h "$rootfs" | cut -f1))."
     fi
-
-    # xorriso replays El Torito + isohybrid MBR/GPT, preserving the same
-    # original x64 Visor, IA32 GRUB, BIOS loader, and embedded FAT32 ESP.
-    # In particular DO NOT regenerate ISO with plain mkisofs here.
-    xorriso_args=(-indev "$original_iso" -outdev "$rebuilt" \
-                  -rm /live/filesystem.squashfs --)
-    for file in "${layer_images[@]}"; do
-        xorriso_args+=(-map "$file" "/live/${file##*/}")
-    done
-    xorriso_args+=(-map "$temp/filesystem.module" /live/filesystem.module)
-    if [[ -f "$temp/md5sum.txt" ]]; then
-        xorriso_args+=(-map "$temp/md5sum.txt" /md5sum.txt)
-    fi
-    xorriso_args+=(-boot_image any replay -compliance no_emul_toc -padding included)
-    _info "Rebuilding the existing hybrid ISO with mountable FAT32-sized layers..."
-    if ! xorriso "${xorriso_args[@]}" >"$temp/xorriso.log" 2>&1; then
-        tail -35 "$temp/xorriso.log" >&2 || true
-        _die "Hybrid ISO repack failed; original bootable ISO has not been overwritten."
-    fi
-    [[ -s "$rebuilt" ]] || _die "Repacked ISO was not created."
-    if ! xorriso -indev "$rebuilt" -report_el_torito plain -report_system_area plain \
-            >"$temp/boot-report.log" 2>&1; then
-        _die "Repacked ISO has unreadable boot records."
-    fi
-    grep -Eq 'El Torito boot img.*UEFI' "$temp/boot-report.log" || \
-        _die "Repacked ISO lost its UEFI boot record."
-    if ! xorriso -osirrox on -indev "$rebuilt" \
-            -extract /live/filesystem.module "$temp/iso-filesystem.module" \
-            >"$temp/manifest-read.log" 2>&1; then
-        _die "Repacked ISO is missing the ordered SquashFS layer manifest."
-    fi
-    cmp -s "$temp/filesystem.module" "$temp/iso-filesystem.module" || \
-        _die "Repacked ISO has a different SquashFS layer manifest."
-    # Once ISO boot structure is valid, publish all its corresponding
-    # images and manifest into live-build's binary tree.
-    mv "$original_iso" "$temp/original.iso"
-    mv "$rebuilt" "$original_iso"
-    mv "$source_img" "$whole"
-    for file in "${layer_images[@]}"; do
-        mv "$file" "$live_dir/${file##*/}"
-    done
-    cp "$temp/filesystem.module" "$live_dir/filesystem.module"
-    [[ ! -f "$temp/md5sum.txt" ]] || cp "$temp/md5sum.txt" "$BUILD_DIR/binary/md5sum.txt"
-    _ok "Hybrid ISO now contains $num FAT32-safe live layers ($ALTERNIX_BUILD_MODE)."
-    rm -rf -- "$temp"
 }
 
 # ── Finish / verify an existing ISO without rebuilding ──────────────
@@ -299,19 +151,7 @@ _finalize_iso() {
     fi
     local sq_info
     [[ -s "$BUILD_DIR/binary/live/filesystem.squashfs" ]] || _die "Missing live filesystem.squashfs."
-    local layer layer_name
-    if [[ -f "$BUILD_DIR/binary/live/filesystem.module" ]]; then
-        while IFS= read -r layer_name || [[ -n "$layer_name" ]]; do
-            [[ -z "$layer_name" ]] && continue
-            [[ "$layer_name" =~ ^filesystem(-[0-9]+)?\.squashfs$ ]] || _die "Invalid rootfs layer: $layer_name"
-            layer="$BUILD_DIR/binary/live/$layer_name"
-            [[ -s "$layer" ]] || _die "Missing rootfs layer: $layer_name"
-            (( $(stat -c %s "$layer") <= 4294967295 )) || _die "Layer exceeds FAT32: $layer_name"
-        done < "$BUILD_DIR/binary/live/filesystem.module"
-    else
-        (( $(stat -c %s "$BUILD_DIR/binary/live/filesystem.squashfs") <= 4294967295 )) || \
-            _die "The rootfs still exceeds FAT32's per-file limit."
-    fi
+    _verify_single_rootfs
     sq_info=$(unsquashfs -s "$BUILD_DIR/binary/live/filesystem.squashfs" 2>&1) || \
         _die "Cannot read squashfs header."
     printf '%s\n' "$sq_info" | grep -Eq '^Compression[[:space:]]+(zstd|gzip|lz4)([[:space:]]|$)' || \
@@ -391,6 +231,11 @@ _finalize_iso() {
     [[ -s "$OUTPUT_ISO" ]] || _die "Final ISO copy is empty."
     size=$(du -sh "$OUTPUT_ISO" | cut -f1)
     _ok "Alternix installer ISO ready: $OUTPUT_ISO ($size)"
+    if [[ "$ALTERNIX_BUILD_MODE" == live-preview ]] && \
+       (( $(stat -c %s "$BUILD_DIR/binary/live/filesystem.squashfs") > 4294967295 )); then
+        _info "WRITE USB AS A RAW IMAGE: Rufus DD mode / USBImager / Linux dd."
+        _info "Do not use Rufus ISO extraction on FAT32: the SquashFS file exceeds 4 GiB."
+    fi
     _info "Boot defaults: 32-bit UEFI = GRUB; 64-bit UEFI = Visor; legacy BIOS = GRUB."
 }
 
@@ -417,7 +262,7 @@ elif [[ $# -eq 0 ]]; then
     _step "Choose AlternixOS x86-64 ISO build"
     printf '%s\n' \
         '  1) x86-64 net-install  — minimal installer; fetch AlternixDE from GitHub if selected' \
-        '  2) x86-64 live-preview — prebuilt AlternixDE, Live boot and fast installation' \
+        '  2) x86-64 live-preview — prebuilt AlternixDE, Live boot, fast copy install (DD/raw USB if >4 GiB)' \
         ''
     if [[ ! -t 0 ]]; then
         _die "No interactive terminal. Specify --mode net-install or --mode live-preview."
@@ -443,6 +288,7 @@ if [[ "$ALTERNIX_BUILD_MODE" == "net-install" ]]; then
     _info 'No prebuilt desktop. The graphical/text installer will clone AlternixDE only if selected.'
 else
     _info 'Prebuild AlternixDE into the ISO. Include Try Alternix (Live) and fast desktop copy.'
+    _info 'Large images must be written to USB in raw/DD mode, not Rufus FAT32 ISO mode.'
 fi
 
 # ── Dependencies ──────────────────────────────────────────────────
@@ -2174,7 +2020,7 @@ if [ -f "$VISOR/visor_x64.efi" ]; then
         # Match Claude's original working 64-bit Visor menu configuration.
         # Keep the flags, menu ordering and background unchanged: do not
         # force graphics, logging, self-heal or resolution overrides here.
-        printf '%s\n' "timeout=5" "default=0" "title=Alternix Installer"
+        printf '%s\n' "timeout=10" "default=0" "title=Alternix Installer"
         [ -n "$BG" ] && printf '%s\n' "$BG"
         entry "Install Alternix"                   "quiet"
         if [ "$(cat ../chroot/etc/alternix/iso-mode 2>/dev/null)" = live-preview ]; then
@@ -2330,8 +2176,22 @@ if [[ ! -f "${BUILD_DIR}/live-image-amd64.hybrid.iso" ]] &&    ! find "${BUILD_D
     _die "live-build produced no ISO. Check ${LB_LOG}"
 fi
 
-# Repack oversized rootfs before the FAT32 and embedded EFI checks.
-_fat32_repack_squashfs
+# Report the main live-preview payload groups so future ISO size changes
+# can be traced to desktop packages rather than guessed from the ISO alone.
+if [[ "$ALTERNIX_BUILD_MODE" == "live-preview" ]]; then
+    _step "Live-preview payload size breakdown"
+    for component in usr opt var/lib/flatpak var/cache/apt root/.cache usr/share/alternix; do
+        component_path="${BUILD_DIR}/chroot/${component}"
+        if [[ -e "$component_path" ]]; then
+            printf '  · %-26s ' "$component"
+            du -sh "$component_path" 2>/dev/null | cut -f1 || true
+        fi
+    done
+fi
+
+# Do not repack the rootfs. The original single SquashFS produced by
+# live-build is required for reliable live-boot on VirtualBox and tablets.
+_verify_single_rootfs
 
 # Verify both 32-bit UEFI entry points before calling this build successful.
 # In particular, EFI/BOOT on the ISO is not what dd-written media loads;
@@ -2341,24 +2201,8 @@ _fat32_repack_squashfs
 _step "Verifying installer root filesystem"
 SQUASHFS="${BUILD_DIR}/binary/live/filesystem.squashfs"
 [[ -s "$SQUASHFS" ]] || _die "No live/filesystem.squashfs in built ISO."
-# Every SquashFS image must fit on FAT32, not merely the first image.
-# A module manifest is mandatory when additional layers exist.
-SQUASHFS_LAYERS=("$SQUASHFS")
-if [[ -s "${BUILD_DIR}/binary/live/filesystem.module" ]]; then
-    SQUASHFS_LAYERS=()
-    while IFS= read -r name || [[ -n "$name" ]]; do
-        [[ -z "$name" ]] && continue
-        [[ "$name" =~ ^filesystem(-[0-9]+)?\.squashfs$ ]] || _die "Unsafe squashfs module name: $name"
-        SQUASHFS_LAYERS+=("${BUILD_DIR}/binary/live/$name")
-    done < "${BUILD_DIR}/binary/live/filesystem.module"
-fi
-for LAYER in "${SQUASHFS_LAYERS[@]}"; do
-    [[ -s "$LAYER" ]] || _die "Missing SquashFS module: $LAYER"
-    (( $(stat -c %s "$LAYER") <= 4294967295 )) || \
-        _die "$(basename "$LAYER") exceeds FAT32's per-file limit."
-    unsquashfs -s "$LAYER" >/dev/null 2>&1 || _die "Invalid SquashFS module: $LAYER"
-done
-_ok "All ${#SQUASHFS_LAYERS[@]} SquashFS layer(s) fit on FAT32."
+# Validate one normal SquashFS instead of the old split layer manifest.
+# The single image may exceed 4 GiB in live-preview's raw hybrid ISO.
 SQUASHFS_INFO="$(unsquashfs -s "$SQUASHFS" 2>&1)" || _die "Cannot inspect live squashfs header."
 printf '%s\n' "$SQUASHFS_INFO" | grep -E 'Compression|Filesystem size' || true
 if ! printf '%s\n' "$SQUASHFS_INFO" | grep -Eiq "^Compression[[:space:]]+${LB_COMPRESSION_CHOICE}([[:space:]]|$)"; then
