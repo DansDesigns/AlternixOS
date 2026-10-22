@@ -695,6 +695,11 @@ usbutils
 # Console keyboard maps (essential — without this kbd may be wrong layout)
 console-setup
 kbd
+# Onboard's docked/start-hidden GSettings vendor override is compiled by
+# installer/onboard-defaults.sh in the 0090 chroot hook.  The desktop's
+# GLib libraries alone do not provide glib-compile-schemas or gsettings.
+# Include the utility BEFORE hooks run (also needed after copy-install).
+libglib2.0-bin
 # loadkeys is part of kbd — no separate package needed
 
 # ── Storage / block ───────────────────────────────────────────────
@@ -1077,6 +1082,24 @@ if [ "$DE_RC" -ne 0 ]; then
     exit 1
 fi
 
+# Set the same Onboard docked keyboard defaults on the LIVE filesystem
+# that the installed-system stage applies to its target. In particular,
+# start-minimized must be set BEFORE Qtile's Onboard autostart. The live
+# session adjusts dock-height again for its actual display dimensions.
+if [ ! -f /usr/share/glib-2.0/schemas/org.onboard.gschema.xml ]; then
+    echo '  x Live desktop is missing the Onboard GSettings schema.'
+    exit 1
+fi
+# The AlternixDE installer may delete its source directory while it is
+# still the shell's cwd. Move to an existing directory before starting a
+# new shell to avoid getcwd warnings during GSettings compilation.
+cd /
+if ! bash /installer/onboard-defaults.sh / 30 Nightshade 1280 800; then
+    echo '  x Could not compile Onboard defaults for the Live desktop.'
+    exit 1
+fi
+echo '  + Live Onboard defaults: bottom dock, full screen width, initially hidden.'
+
 # SKEL COPY — DO NOT REMOVE
 # The build writes configs into the building user's home. The real user
 # does not exist yet — configure_system.sh creates them during the
@@ -1088,6 +1111,9 @@ for d in .config .local/share; do
         cp -a "${HOME}/${d}/." "/etc/skel/${d}/" 2>/dev/null || true
     fi
 done
+
+# The Live user's desktop shortcuts and wallpaper were copied from root
+# above; installed users continue to receive the unmodified /etc/skel.
 
 # SUDOERS CLEANUP — DO NOT REMOVE
 # install-alternix_devuan.sh:66 writes a permanent NOPASSWD rule so its
@@ -1126,6 +1152,177 @@ if [ -z "$QTILE_GLOBAL" ] || [ ! -x "$QTILE_GLOBAL" ]; then
     echo '  x System-wide Qtile is missing; a copied installation would not log in.'
     exit 1
 fi
+# LIVE ACCOUNT — keep exactly the same compiled Qtile environment and
+# XLibre invocation as the boot-tested root-based ISO, but expose a COPY
+# of the venv and configs to a non-root desktop account. Never make /root
+# world-traversable and never run the live desktop with sudo.
+#
+# Python console entrypoints embedded in a copied venv contain absolute
+# shebangs, so merely copying the directory would fail. Rewrite those
+# entrypoint shebangs for the new location and test import as the user.
+LIVE_NAME=alternix-live
+LIVE_HOME=/home/alternix-live
+LIVE_VENV=/opt/alternix-live/qtile_venv
+if id "$LIVE_NAME" >/dev/null 2>&1; then
+    echo '  x Live account unexpectedly exists before desktop build.'
+    exit 1
+fi
+useradd -m -s /bin/bash -U "$LIVE_NAME"
+# The temporary account is autologged in by agetty ONLY in Live mode.
+# Keep its password locked and do not give it full passwordless sudo.
+passwd -l "$LIVE_NAME" >/dev/null 2>&1 || true
+for group in audio video input render plugdev netdev cdrom; do
+    if getent group "$group" >/dev/null 2>&1; then
+        usermod -aG "$group" "$LIVE_NAME"
+    fi
+done
+mkdir -p /opt/alternix-live
+cp -a /root/.qtile_venv "$LIVE_VENV"
+python3 - "$LIVE_VENV" <<'LIVEVENVPY'
+import pathlib, sys
+venv = pathlib.Path(sys.argv[1])
+bindir = venv / 'bin'
+old = b'/root/.qtile_venv/bin/'
+new = (str(bindir) + '/').encode()
+count = 0
+for entry in bindir.iterdir():
+    if not entry.is_file() or entry.is_symlink():
+        continue
+    with entry.open('rb') as f:
+        head = f.readline()
+    if head.startswith(b'#!') and old in head:
+        data = entry.read_bytes()
+        entry.write_bytes(data.replace(old, new, 1))
+        count += 1
+qtile = bindir / 'qtile'
+if not qtile.is_file() or old in qtile.read_bytes().split(b'\n', 1)[0]:
+    raise SystemExit('The Live Qtile console script still has its root venv shebang')
+print(f'  + Rebased {count} Qtile venv command entrypoints')
+LIVEVENVPY
+# The shared environment stays owned by root and cannot be modified by
+# programs running in the unprivileged Live session.
+chown -R root:root /opt/alternix-live
+chmod -R a+rX /opt/alternix-live
+# The desktop installer writes configuration to the building root user's
+# home, and wallpapers separately to ~/Pictures (not /etc/skel).
+# Copy both, so the preview has the same background as an installed user.
+for item in .config .local/bin .local/share .alacritty.toml Pictures/wallpapers extras; do
+    if [ -d "/root/$item" ]; then
+        mkdir -p "$LIVE_HOME/$item"
+        cp -a "/root/$item/." "$LIVE_HOME/$item/"
+    elif [ -f "/root/$item" ]; then
+        mkdir -p "$LIVE_HOME/$(dirname "$item")"
+        cp -a "/root/$item" "$LIVE_HOME/$item"
+    fi
+done
+# Also support builds in which wallpapers were installed only in the
+# preserved source tree (while the desktop installer removed its clone).
+if [ ! -d "$LIVE_HOME/Pictures/wallpapers" ] && \
+   [ -d /usr/share/alternix/AlternixDE/Alternix/wallpapers ]; then
+    mkdir -p "$LIVE_HOME/Pictures/wallpapers"
+    cp -a /usr/share/alternix/AlternixDE/Alternix/wallpapers/. "$LIVE_HOME/Pictures/wallpapers/"
+fi
+# Backwards compatibility for user configs with absolute root wallpaper
+# paths; don't change global/installed-user configurations.
+if [ -d "$LIVE_HOME/.config/qtile" ]; then
+    find "$LIVE_HOME/.config/qtile" -type f \
+        \( -name '*.py' -o -name '*.sh' -o -name '*.json' \) -print0 | \
+      xargs -0 -r sed -i "s|/root/Pictures/wallpapers|$LIVE_HOME/Pictures/wallpapers|g"
+fi
+# The Live home is not the installer's root home. Give the Live user the
+# requested osm-paper selection, and normalise ~ and old /root paths to an
+# absolute path. The existing osm-paper-restore script tests paths literally:
+# it does NOT expand ~ from its config and silently exits if the file is absent.
+# Only this temporary Live account's config is changed; installed-user
+# wallpaper preferences and the system-wide restore binary stay untouched.
+LIVE_PAPER_CONF="$LIVE_HOME/.config/Alternix/osm-paper.conf"
+mkdir -p "$(dirname "$LIVE_PAPER_CONF")"
+if [ -s /installer/osm-paper.conf ]; then
+    cp -f /installer/osm-paper.conf "$LIVE_PAPER_CONF"
+fi
+python3 - "$LIVE_PAPER_CONF" "$LIVE_HOME" <<'LIVEPAPERPY'
+import configparser, pathlib, sys
+conf = pathlib.Path(sys.argv[1])
+home = pathlib.Path(sys.argv[2])
+wallpapers = home / "Pictures/wallpapers"
+cfg = configparser.ConfigParser(interpolation=None)
+if conf.exists():
+    cfg.read(conf)
+if not cfg.has_section("last"):
+    cfg.add_section("last")
+raw = cfg.get("last", "wallpaper", fallback="~/Pictures/wallpapers/0253.jpg").strip()
+if raw.startswith("~/"):
+    image = home / raw[2:]
+elif raw.startswith("/root/"):
+    image = home / raw[len("/root/"):]
+elif raw.startswith("/"):
+    image = pathlib.Path(raw)
+else:
+    image = home / raw
+if not image.is_file():
+    candidates = sorted(p for p in wallpapers.glob("*") if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp"))
+    print(f"  ! Live wallpaper selected by osm-paper.conf not found: {image}")
+    if candidates:
+        image = candidates[0]
+        print(f"  ! Falling back to available wallpaper: {image}")
+    else:
+        print("  ! No Live wallpaper images present; restore will be skipped.")
+        image = None
+if image:
+    cfg.set("last", "wallpaper", str(image))
+    if not cfg.get("last", "mode", fallback="").strip():
+        cfg.set("last", "mode", "zoom")
+    with conf.open("w") as f:
+        cfg.write(f)
+    print(f"  + Live osm-paper wallpaper configured: {image}")
+LIVEPAPERPY
+# Some Alternix helper commands still look for $HOME/.qtile_venv.
+# Point that name to the shared read-only copy for Live only.
+ln -sfn "$LIVE_VENV" "$LIVE_HOME/.qtile_venv"
+# Ensure all config, user scripts and wallpaper files are owned by the
+# temporary account, including the contents copied from /etc/skel.
+chown -R "$LIVE_NAME:$LIVE_NAME" "$LIVE_HOME"
+# Avoid relying on the new user to install a separate, potentially
+# incompatible Qtile version or start a system-wide Qtile by mistake.
+if ! runuser -u "$LIVE_NAME" -- "$LIVE_VENV/bin/python3" -c 'import libqtile; import libqtile.command'; then
+    echo '  x Shared Live Qtile venv cannot import as the unprivileged user.'
+    exit 1
+fi
+[ -f "$LIVE_HOME/.config/qtile/config.py" ] || {
+    echo '  x The Live account did not receive the Qtile configuration.'
+    exit 1
+}
+# Live mode now uses the SAME tested global profile.d login dispatcher as
+# the working root-based ISO. A standalone .bash_profile launch can be
+# skipped by live-config's login-shell setup, leaving a silent tty1 with
+# no desktop. Keep the account-specific profile informational only.
+cat > "$LIVE_HOME/.bash_profile" <<'LIVEUSERPROFILE'
+# The Live graphical session is started by /etc/profile.d/alternix-installer.sh.
+# This avoids separate competing X startup paths for the two boot modes.
+LIVEUSERPROFILE
+chown "$LIVE_NAME:$LIVE_NAME" "$LIVE_HOME/.bash_profile"
+chmod 644 "$LIVE_HOME/.bash_profile"
+# The installed-system .xinitrc/.bash_profile in /etc/skel stay unchanged.
+# Only osm-install is permitted to elevate; no ALL-commands NOPASSWD.
+cat >/etc/sudoers.d/alternix-live-installer <<'LIVESUDO'
+Defaults!/usr/local/bin/osm-install env_keep += "DISPLAY XAUTHORITY"
+alternix-live ALL=(root) NOPASSWD: /usr/local/bin/osm-install
+LIVESUDO
+chmod 440 /etc/sudoers.d/alternix-live-installer
+if command -v visudo >/dev/null 2>&1; then
+    visudo -cf /etc/sudoers.d/alternix-live-installer >/dev/null || exit 1
+fi
+mkdir -p "$LIVE_HOME/.local/share/applications"
+for app in htop fetch os-check-update; do
+    if [ -f "/usr/share/applications/$app.desktop" ]; then
+        sed -e 's|^Exec=alacritty -e |Exec=/usr/local/bin/alternix-live-terminal -e |' \
+            -e 's|^Terminal=true|Terminal=false|' \
+            "/usr/share/applications/$app.desktop" > "$LIVE_HOME/.local/share/applications/$app.desktop"
+    fi
+done
+chown -R "$LIVE_NAME:$LIVE_NAME" "$LIVE_HOME/.local/share/applications"
+echo '  + Unprivileged Live user ready (private desktop, shared Qtile venv, scoped installer elevation).'
+
 # The desktop installer initially links this path to root's private venv.
 # Copy-installed users cannot access /root: point it to the global binary.
 mkdir -p /usr/lib/udev
@@ -1202,31 +1399,42 @@ _ok "Graphical installer stage and $ALTERNIX_BUILD_MODE desktop policy configure
 # ── Auto-launch installer on boot ────────────────────────────────
 _step "Configuring auto-launch"
 
-# 1. Write inittab to autologin root on tty1 via a chroot hook
+# 1. Write inittab tty1 getty selector (Live user vs root installer)
 #    (inittab exists in the chroot because we install sysvinit-core)
 mkdir -p config/hooks/normal
 cat > config/hooks/normal/0070-alternix-autologin.hook.chroot << 'HOOKEOF'
 #!/bin/bash
-# Replace tty1 getty with autologin getty
+# tty1 selects its login account from the actual kernel boot mode.
+# Dedicated Install / TUI remain root; Try Alternix logs into the
+# unprivileged preview account as a real controlling-tty/PAM login.
 if [ -f /etc/inittab ]; then
-    # Comment out existing tty1 line and add autologin version
-    sed -i "s|^1:.*:respawn:.*tty1.*|#&|" /etc/inittab
-    echo "1:2345:respawn:/sbin/agetty --autologin root --noclear tty1 38400 linux" >> /etc/inittab
+    sed -i '/^1:.*:respawn:.*tty1.*/d' /etc/inittab
+    echo '1:2345:respawn:/usr/local/sbin/alternix-tty-select' >>/etc/inittab
 fi
 HOOKEOF
 chmod +x config/hooks/normal/0070-alternix-autologin.hook.chroot
 
-# 2. profile.d script launches installer once root is logged in
+# 2. profile.d is the proven login hook for both installer and Live desktop.
+# Keep tty1 and kernel-mode checks strict, so other shells and the installed
+# system do not accidentally start a second graphical session.
 mkdir -p config/includes.chroot/etc/profile.d
 cat > config/includes.chroot/etc/profile.d/alternix-installer.sh << 'EOF'
 #!/bin/bash
-# Auto-launch the Alternix installer if running as root on tty1.
-#
-# Graphical by default. Three of the four reference machines are
-# tablets with no keyboard attached, so a TUI is unusable on them.
-# The text installer stays reachable from the GRUB menu, which adds
-# alternix.tui=1 to the kernel command line.
+# tty1 startup dispatcher. The same /etc/profile.d hook launched the X
+# server successfully in the last confirmed-working root-based Live ISO.
+# Use it for the unprivileged Live login too, rather than relying on the
+# display manager/PAM path to source the user's ~/.bash_profile.
 
+# The controlling tty and kernel boot mode are the authoritative guards.
+# Some profile fragments export DISPLAY=:0 before X is actually running.
+if [ "$(id -un)" = alternix-live ] && [ "$(tty)" = /dev/tty1 ] && \
+   grep -Fqw 'alternix.live=1' /proc/cmdline 2>/dev/null; then
+    /usr/local/bin/alternix-live-launch
+    return 0
+fi
+
+# Install boot modes: preserve the working privileged graphical installer.
+# Graphical by default, with text mode selected by alternix.tui=1.
 [ "$(id -u)" -eq 0 ] || return 0
 [ "$(tty)" = "/dev/tty1" ] || return 0
 [ -f /installer/install.sh ] || return 0
@@ -1242,18 +1450,8 @@ command -v startx >/dev/null 2>&1 || _want_tui=1
 # A separate boot entry selects the real Alternix desktop without opening
 # the installer. Do not start an incomplete/unbaked desktop.
 if grep -qw 'alternix.live=1' /proc/cmdline 2>/dev/null; then
-    if [ ! -s /etc/alternix/de-baked ] || \
-       [ ! -x /root/.qtile_venv/bin/qtile ]; then
-        echo 'Alternix Live is unavailable: this image has no prebuilt desktop.'
-        echo 'The ISO builder must complete the AlternixDE build first.'
-        return 0
-    fi
-    export XCURSOR_THEME=Bibata-Modern-Ice
-    export XCURSOR_SIZE=24
-    echo 'Starting Alternix Live. Launch osm-install to install from this session.'
-    startx /usr/local/bin/alternix-live-session -- -nolisten tcp vt1 \
-        > /tmp/alternix-live-xorg.log 2>&1
-    echo 'Live desktop ended. Run: startx /usr/local/bin/alternix-live-session'
+    echo 'Unexpected root login in Live mode. Check /usr/local/sbin/alternix-tty-select.'
+    echo 'The Live desktop must not run as root.'
     return 0
 fi
 
@@ -1286,27 +1484,217 @@ chmod +x config/includes.chroot/etc/profile.d/alternix-installer.sh
 # This launch script is inert in net-install, which has no Live boot entry.
 mkdir -p config/includes.chroot/usr/local/bin \
          config/includes.chroot/usr/share/applications
+mkdir -p config/includes.chroot/usr/local/sbin
+cat > config/includes.chroot/usr/local/sbin/alternix-tty-select <<'TTYSELECTEOF'
+#!/bin/sh
+# Boot-mode-sensitive login; all modes share the same underlying ISO.
+if grep -qw 'alternix.live=1' /proc/cmdline 2>/dev/null && \
+   [ -s /etc/alternix/de-baked ] && \
+   id alternix-live >/dev/null 2>&1; then
+    exec /sbin/agetty --autologin alternix-live --noclear tty1 38400 linux
+fi
+exec /sbin/agetty --autologin root --noclear tty1 38400 linux
+TTYSELECTEOF
+chmod +x config/includes.chroot/usr/local/sbin/alternix-tty-select
+# The starter is called from the login hook above, once, as the Live
+# account and with its real controlling tty. A one-attempt marker prevents
+# console/black-screen flashing if either XLibre or Qtile fails. Show an
+# actionable message without swallowing the reason into a hidden log.
+cat > config/includes.chroot/usr/local/bin/alternix-live-launch <<'LIVELAUNCHEOF'
+#!/bin/sh
+[ "$(id -un)" = alternix-live ] || exit 1
+[ "$(tty)" = /dev/tty1 ] || exit 0
+grep -Fqw 'alternix.live=1' /proc/cmdline 2>/dev/null || exit 0
+export HOME=/home/alternix-live
+export XCURSOR_THEME=Bibata-Modern-Ice
+export XCURSOR_SIZE=24
+umask 077
+mkdir -p "$HOME/.cache" || exit 1
+marker="$HOME/.cache/alternix-live-x-attempted"
+log="$HOME/.cache/alternix-live-xorg.log"
+if [ -e "$marker" ]; then
+    echo 'Live desktop was already attempted this boot; not restarting in a loop.'
+    echo "To check errors: cat $log"
+    exit 0
+fi
+: > "$marker"
+echo 'Starting Alternix Live as alternix-live (non-root)...'
+if ! command -v startx >/dev/null 2>&1; then
+    echo 'ERROR: startx is missing; cannot launch the desktop.'
+    exit 1
+fi
+if startx /usr/local/bin/alternix-live-session -- -nolisten tcp vt1 >"$log" 2>&1; then
+    echo 'Alternix Live desktop exited.'
+else
+    echo 'ERROR: Alternix Live graphical session did not start.'
+    echo "Detailed log: $log"
+    tail -70 "$log" 2>/dev/null || true
+    echo 'Also check: ~/.local/share/xorg/Xorg.0.log'
+fi
+echo 'Manual retry: startx /usr/local/bin/alternix-live-session -- -nolisten tcp vt1'
+LIVELAUNCHEOF
+chmod +x config/includes.chroot/usr/local/bin/alternix-live-launch
+
+# Only the installer needs elevated permissions; the Qtile desktop
+# and every other Live application retain the alternix-live identity.
+cat > config/includes.chroot/usr/local/bin/alternix-live-install <<'LIVEINSTALLEOF'
+#!/bin/sh
+if [ "$(id -u)" -eq 0 ]; then
+    exec /usr/local/bin/osm-install "$@"
+fi
+[ "$(id -un)" = alternix-live ] || exit 1
+[ -n "${DISPLAY:-}" ] || exit 1
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+exec sudo -n /usr/local/bin/osm-install "$@"
+LIVEINSTALLEOF
+chmod +x config/includes.chroot/usr/local/bin/alternix-live-install
 cat > config/includes.chroot/usr/local/bin/alternix-live-session << 'LIVEEOF'
 #!/bin/sh
-export HOME=/root
-export XDG_CONFIG_HOME=/root/.config
-export XDG_CACHE_HOME=/root/.cache
-export XDG_DATA_HOME=/root/.local/share
-export PATH=/root/.qtile_venv/bin:/usr/local/bin:/usr/bin:/bin
-cd /root || exit 1
-[ -x /root/.qtile_venv/bin/qtile ] || {
-    echo 'Alternix Qtile executable is missing from live image.' >&2
+# Same startx -> dbus-launch -> Qtile command chain as the working ISO,
+# but with an ordinary user and a read-only relocated copy of its venv.
+[ "$(id -un)" = alternix-live ] || { echo 'Refusing root Live session' >&2; exit 1; }
+export HOME=/home/alternix-live
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_CACHE_HOME="$HOME/.cache"
+export XDG_DATA_HOME="$HOME/.local/share"
+export PATH=/opt/alternix-live/qtile_venv/bin:/usr/local/bin:/usr/bin:/bin
+cd "$HOME" || exit 1
+[ -x /opt/alternix-live/qtile_venv/bin/qtile ] || {
+    echo 'Alternix Live Qtile executable is missing.' >&2
     exit 1
 }
-exec dbus-launch --exit-with-session /root/.qtile_venv/bin/qtile start
+exec dbus-launch --exit-with-session /usr/local/bin/alternix-live-desktop
 LIVEEOF
 chmod +x config/includes.chroot/usr/local/bin/alternix-live-session
+
+# The live session starts with its OWN screen dimensions, not those of
+# the machine on which the ISO was built. Onboard's dock-expand=true
+# handles edge-to-edge width automatically; dock-height is recalculated
+# from the current XRandR output (30% of the display height in each
+# orientation). Only live-preview uses this; the target install retains
+# its own settings from installer/onboard-defaults.sh.
+cat > config/includes.chroot/usr/local/bin/alternix-live-desktop << 'LIVEKEYBOARDEOF'
+#!/bin/sh
+# Runs WITHIN dbus-launch and AFTER X is available, BEFORE Qtile autostart.
+# Don't let a missing/disconnected monitor prevent the desktop booting.
+if command -v gsettings >/dev/null 2>&1; then
+    gsettings set org.onboard start-minimized true 2>/dev/null || true
+    gsettings set org.onboard.window docking-enabled true 2>/dev/null || true
+    gsettings set org.onboard.window docking-edge bottom 2>/dev/null || true
+    gsettings set org.onboard.window.landscape dock-expand true 2>/dev/null || true
+    gsettings set org.onboard.window.portrait dock-expand true 2>/dev/null || true
+
+    # Prefer the primary connected monitor, then the first connected one.
+    # XRandR's Screen 0 size covers all monitors and is NOT appropriate.
+    if command -v xrandr >/dev/null 2>&1; then
+        mode=$(xrandr --current 2>/dev/null | awk '
+            $2 == "connected" {
+                for (i=3; i<=NF; i++) {
+                    if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) {
+                        split($i, a, "+")
+                        if ($3 == "primary") { print a[1]; found=1; exit }
+                        if (fallback == "") fallback=a[1]
+                        break
+                    }
+                }
+            }
+            END { if (!found && fallback != "") print fallback }
+        ')
+        case "$mode" in
+            *x*)
+                sw=${mode%x*}; sh=${mode#*x}
+                case "$sw:$sh" in
+                    *[!0-9:]*|:*|*:) ;;
+                    *)
+                        if [ "$sw" -ge 320 ] && [ "$sh" -ge 320 ]; then
+                            if [ "$sw" -gt "$sh" ]; then
+                                long=$sw; short=$sh
+                            else
+                                long=$sh; short=$sw
+                            fi
+                            landscape_height=$((short * 30 / 100))
+                            portrait_height=$((long * 30 / 100))
+                            gsettings set org.onboard.window.landscape dock-height "$landscape_height" 2>/dev/null || true
+                            gsettings set org.onboard.window.portrait dock-height "$portrait_height" 2>/dev/null || true
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+    fi
+fi
+
+# Apply the wallpaper after Qtile has acquired the X root window, not
+# before it starts (when Qtile can replace the root pixmap). The helper
+# uses the genuine osm-paper-restore command and is Live-mode only.
+( /usr/local/bin/alternix-live-wallpaper \
+    >> "$HOME/.cache/alternix-live-wallpaper.log" 2>&1 ) </dev/null &
+
+# Qtile's existing Onboard launcher remains in control. It may start
+# Onboard, but start-minimized ensures no keyboard obscures the wallpaper
+# until the user opens it from the taskbar/launcher.
+exec /opt/alternix-live/qtile_venv/bin/qtile start
+LIVEKEYBOARDEOF
+chmod +x config/includes.chroot/usr/local/bin/alternix-live-desktop
+# Wait for Qtile rather than racing its initial root-window setup. This
+# is not a general background service and exits after one restore attempt.
+cat > config/includes.chroot/usr/local/bin/alternix-live-wallpaper <<'LIVEPAPERRESTOREEOF'
+#!/bin/sh
+[ "$(id -un)" = alternix-live ] || exit 0
+export HOME=/home/alternix-live
+conf="$HOME/.config/Alternix/osm-paper.conf"
+[ -s "$conf" ] || { echo 'No Live osm-paper.conf; nothing to restore'; exit 0; }
+# Xprop is available from the existing x11-utils desktop dependencies.
+# Most WMs set this EWMH property as soon as they claim the display.
+if command -v xprop >/dev/null 2>&1; then
+    tries=0
+    while [ "$tries" -lt 40 ]; do
+        info=$(xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null || true)
+        case "$info" in
+            *'window id #'*) break ;;
+        esac
+        sleep 0.25
+        tries=$((tries + 1))
+    done
+else
+    sleep 2
+fi
+# Allow Qtile's screen and wallpaper initialization to settle.
+sleep 1
+if ! command -v xwallpaper >/dev/null 2>&1; then
+    echo 'ERROR: xwallpaper is not installed in the Live image' >&2
+    exit 1
+fi
+if [ ! -x /usr/local/bin/osm-paper-restore ]; then
+    echo 'ERROR: osm-paper-restore is absent from the Live image' >&2
+    exit 1
+fi
+/usr/local/bin/osm-paper-restore
+LIVEPAPERRESTOREEOF
+chmod +x config/includes.chroot/usr/local/bin/alternix-live-wallpaper
+# No-OpenGL fallback for the upstream Alacritty-only console apps. Only
+# the live user's local desktop files call this wrapper.
+cat > config/includes.chroot/usr/local/bin/alternix-live-terminal <<'LIVETERMINALEOF'
+#!/bin/sh
+[ "${1:-}" = -e ] && shift
+[ "$#" -gt 0 ] || exit 2
+if command -v alacritty >/dev/null 2>&1; then
+    alacritty -e "$@" && exit 0
+fi
+# VirtualBox and older tablet GPUs may not expose suitable OpenGL.
+if command -v xterm >/dev/null 2>&1; then
+    exec xterm -e "$@"
+fi
+printf 'No working terminal emulator for %s\n' "$1" >&2
+exit 1
+LIVETERMINALEOF
+chmod +x config/includes.chroot/usr/local/bin/alternix-live-terminal
 cat > config/includes.chroot/usr/share/applications/alternix-install.desktop << 'LIVEDESKTOP'
 [Desktop Entry]
 Type=Application
 Name=Install Alternix
 Comment=Install Alternix from the live desktop
-Exec=/usr/local/bin/osm-install
+Exec=/usr/local/bin/alternix-live-install
 Icon=system-software-install
 Terminal=false
 Categories=System;

@@ -267,7 +267,7 @@ _configure_user() {
     if [[ "${ALTERNIX_COPY_INSTALL:-0}" -eq 1 &&
           "${ALTERNIX_DESKTOP:-}" == "alternix" &&
           -f "${ALTERNIX_MOUNT}/etc/inittab" ]]; then
-        sed -i -E '/^#?1:[^:]*:[^:]*:.*tty1/d' "${ALTERNIX_MOUNT}/etc/inittab"
+        sed -i -E '/^#?1:[^:]*:[^:]*:.*(tty1|alternix-tty-select)/d' "${ALTERNIX_MOUNT}/etc/inittab"
         printf '1:2345:respawn:/sbin/agetty --autologin %s --noclear tty1 linux\n' \
             "${ALTERNIX_USERNAME}" >> "${ALTERNIX_MOUNT}/etc/inittab"
         ok "tty1 autologin configured for ${ALTERNIX_USERNAME}."

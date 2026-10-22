@@ -285,9 +285,26 @@ EOF
     rm -f "${ALTERNIX_MOUNT}/root/.xinitrc.install" \
           "${ALTERNIX_MOUNT}/etc/alternix-live-installer" 2>/dev/null || true
 
+    # Do not leave Live-only menu shortcuts, session launchers or an
+    # autologin helper on the installed system. The target's normal
+    # user/Qtile startup is configured later by configure_system.sh.
+    rm -f "${ALTERNIX_MOUNT}/usr/share/applications/alternix-install.desktop" \
+          "${ALTERNIX_MOUNT}/usr/local/bin/alternix-live-session" \
+          "${ALTERNIX_MOUNT}/usr/local/bin/alternix-live-desktop" \
+          "${ALTERNIX_MOUNT}/usr/local/bin/alternix-live-wallpaper" \
+          "${ALTERNIX_MOUNT}/usr/local/bin/alternix-live-terminal" \
+          "${ALTERNIX_MOUNT}/usr/local/bin/alternix-live-install" \
+          "${ALTERNIX_MOUNT}/usr/local/sbin/alternix-tty-select" \
+          "${ALTERNIX_MOUNT}/etc/sudoers.d/alternix-live-installer" \
+          2>/dev/null || true
+
+    # This is a root-owned, read-only Qtile venv copied only for the Live
+    # desktop. Normal installed accounts use the system-wide Qtile binary.
+    rm -rf -- "${ALTERNIX_MOUNT}/opt/alternix-live" 2>/dev/null || true
+
     # ── Remove the live user ──────────────────────────────────────
-    # live-config creates this account with a blank password and
-    # passwordless sudo. It must not reach the installed system.
+    # The prebuilt image includes a disposable, password-locked Live account.
+    # It must not reach the installed system.
     local live_user
     for live_user in user live alternix-live; do
         if _copy_chroot "id -u ${live_user}" >/dev/null 2>&1; then
@@ -303,7 +320,8 @@ EOF
     # Live autologin in inittab must go, or the installed system logs
     # a now-deleted user straight in on tty1.
     if [[ -f "${ALTERNIX_MOUNT}/etc/inittab" ]]; then
-        sed -i '/autologin/d' "${ALTERNIX_MOUNT}/etc/inittab" 2>/dev/null || true
+        sed -i -e '/autologin/d' -e '/alternix-tty-select/d' \
+            "${ALTERNIX_MOUNT}/etc/inittab" 2>/dev/null || true
     fi
 
     # ── Identity that must be unique per machine ──────────────────

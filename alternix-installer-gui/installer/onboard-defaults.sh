@@ -45,12 +45,14 @@ write_override() {   # pct theme_path long short
     local pkh=$(( long  * pct / 100 ))
 
     cat <<EOF
-# Written by the Alternix installer (installer/onboard-defaults.sh).
+# Written by Alternix (installer/onboard-defaults.sh).
 # Defaults only: changes made in onboard's own preferences override them.
 
 [org.onboard]
 theme='${theme}'
 system-theme-tracking-enabled=false
+# Keep Onboard running but initially hidden; the taskbar toggle opens it.
+start-minimized=true
 
 [org.onboard.window]
 docking-enabled=true
@@ -81,7 +83,14 @@ panel_mode() {
 }
 
 main() {
-    local root="${1%/}" pct="${2:-}" theme_name="${3:-}" sw="${4:-}" sh="${5:-}"
+    # Keep / intact: ${1%/} turns the live image root "/" into "" and
+    # makes the schema compiler run as `chroot "" ...` (build failure).
+    local root="${1:-}" pct="${2:-}" theme_name="${3:-}" sw="${4:-}" sh="${5:-}"
+    if [[ -z "$root" ]]; then
+        _warn "missing target root; refusing to modify GSettings defaults."
+        return 1
+    fi
+    [[ "$root" == / ]] || root="${root%/}"
 
     if [[ ! -f "${root}/${SCHEMA_REL}" ]]; then
         _warn "onboard is not installed in the target; skipping keyboard defaults."
