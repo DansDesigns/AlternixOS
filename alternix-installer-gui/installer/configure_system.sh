@@ -294,6 +294,29 @@ _configure_sudoers() {
         echo "@includedir /etc/sudoers.d" >> "${ALTERNIX_MOUNT}/etc/sudoers"
     fi
 
+    # POWER MENU PERMISSIONS: The prebuilt live system used to ship a
+    # blanket NOPASSWD sudo rule. Removing it was correct for security but
+    # broke osm-power -> osm-sudo -> sudo -S reboot/poweroff: osm-lock's
+    # pattern/PIN is not the Linux password and sudo -S has no password input.
+    # Keep the existing Alternix authentication UI; authorize ONLY these
+    # two actions for installed users in the sudo group. This overwrites
+    # the temporary alternix-live rule copied from the Live filesystem.
+    if [[ "${ALTERNIX_DESKTOP:-}" == "alternix" ]]; then
+        local power_policy="${ALTERNIX_MOUNT}/etc/sudoers.d/90-alternix-power"
+        cat > "$power_policy" <<'INSTALLED_POWER_SUDO'
+Cmnd_Alias ALTERNIX_POWER_CMDS = /usr/sbin/reboot, /usr/sbin/poweroff, /sbin/reboot, /sbin/poweroff
+%sudo ALL=(root) NOPASSWD: ALTERNIX_POWER_CMDS
+INSTALLED_POWER_SUDO
+        chmod 0440 "$power_policy"
+        if [[ -x "${ALTERNIX_MOUNT}/usr/sbin/visudo" ]]; then
+            chroot "$ALTERNIX_MOUNT" /usr/sbin/visudo -cf /etc/sudoers.d/90-alternix-power >/dev/null || {
+                err "Restricted Alternix power sudoers policy failed validation."
+                return 1
+            }
+        fi
+        ok "Power menu: reboot and poweroff permitted without unrestricted sudo."
+    fi
+
     ok "sudo configured for ${ALTERNIX_USERNAME}."
 }
 

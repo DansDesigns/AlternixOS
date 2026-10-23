@@ -298,6 +298,21 @@ EOF
           "${ALTERNIX_MOUNT}/etc/sudoers.d/alternix-live-installer" \
           2>/dev/null || true
 
+    # Restore the original desktop launcher files before installing the
+    # system: the Live app launcher needs one user-local fallback entry,
+    # while the installed account should use its original Alacritty entries.
+    local entry
+    for entry in htop fetch os-check-update; do
+        if [[ -f "${ALTERNIX_MOUNT}/usr/share/alternix/live-original-launchers/${entry}.desktop" ]]; then
+            mv -f -- "${ALTERNIX_MOUNT}/usr/share/alternix/live-original-launchers/${entry}.desktop" \
+                   "${ALTERNIX_MOUNT}/usr/share/applications/${entry}.desktop"
+        fi
+    done
+    rm -rf -- "${ALTERNIX_MOUNT}/usr/share/alternix/live-original-launchers"
+    # The Live network grants must never remain on an installed machine.
+    rm -f -- "${ALTERNIX_MOUNT}/etc/polkit-1/rules.d/49-alternix-live-network.rules" \
+               "${ALTERNIX_MOUNT}/etc/sudoers.d/alternix-live-wifi-scan"
+
     # This is a root-owned, read-only Qtile venv copied only for the Live
     # desktop. Normal installed accounts use the system-wide Qtile binary.
     rm -rf -- "${ALTERNIX_MOUNT}/opt/alternix-live" 2>/dev/null || true
@@ -352,6 +367,107 @@ EOF
     rm -rf "${ALTERNIX_MOUNT}/tmp"/* "${ALTERNIX_MOUNT}/var/tmp"/* 2>/dev/null || true
 
     ok "Live components removed."
+}
+
+# ── Personalise bundled user assets for installed account ──────
+# The ISO build compiled AlternixDE as root. The system-wide binaries
+# are already installed, but root's personal files only reach the new
+# account through /etc/skel. Rewrite those old absolute build-account
+# paths AFTER useradd -m (and BEFORE first installed boot).
+personalise_prebuilt_home() {
+    section "Installing Alternix user additions"
+
+    local home="${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}"
+    local relative
+    for relative in \
+        .alternix-prebuilt-home \
+        .config/qtile/config.py \
+        .config/Alternix/sounds \
+        .local/share/applications/breakout.desktop \
+        Pictures/wallpapers \
+        extras/games/breakout.html; do
+        [[ -e "$home/$relative" ]] || \
+            die "Missing installed home asset: $relative (check /etc/skel in the ISO)."
+    done
+    [[ -x "${ALTERNIX_MOUNT}/usr/local/bin/osm-launcher" ]] || \
+        die "The prebuilt osm-launcher binary is missing from the target."
+    [[ -x "${ALTERNIX_MOUNT}/usr/local/bin/starship" ||
+       -x "${ALTERNIX_MOUNT}/usr/bin/starship" ]] || \
+        die "Starship was not copied into the target system."
+
+    # Python3 is present in the prebuilt desktop and can update text
+    # without touching PNGs, sounds, game resources or other binaries.
+    python3 - "$home" "$ALTERNIX_USERNAME" <<'ALTUSERPATHPY' || \
+        die "Could not personalise installed Alternix home paths."
+import configparser
+from pathlib import Path
+import sys
+home = Path(sys.argv[1])
+name = sys.argv[2]
+logical_home = '/home/' + name
+rebase = {'/root/': logical_home + '/',
+          '/home/alternix-live/': logical_home + '/',
+          '/home/alternix-user/': logical_home + '/'}
+suffixes = {'.conf', '.ini', '.desktop', '.py', '.sh', '.toml',
+            '.json', '.cfg', '.yaml', '.yml', '.bashrc', '.profile',
+            '.xinitrc'}
+changed = 0
+for folder in [home/'.config', home/'.local', home/'extras']:
+    if not folder.is_dir():
+        continue
+    for p in folder.rglob('*'):
+        if p.is_symlink() or not p.is_file() or p.suffix.lower() not in suffixes:
+            continue
+        if p.stat().st_size > 2_000_000:
+            continue
+        try:
+            content = p.read_text(encoding='utf-8')
+        except (UnicodeError, OSError):
+            continue
+        new = content
+        for old, replacement in rebase.items():
+            new = new.replace(old, replacement)
+        if new != content:
+            p.write_text(new, encoding='utf-8')
+            changed += 1
+# osm-paper-restore tests filesystem paths literally: the tilde in
+# the user's original osm-paper.conf must be expanded for this account.
+wallcfg = home/'.config/Alternix/osm-paper.conf'
+if wallcfg.is_file():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(wallcfg)
+    if cfg.has_section('last'):
+        path = cfg.get('last', 'wallpaper', fallback='').strip()
+        if path.startswith('~/'):
+            path = logical_home + '/' + path[2:]
+        elif path.startswith('/root/'):
+            path = logical_home + path[5:]
+        cfg.set('last', 'wallpaper', path)
+        with wallcfg.open('w') as stream:
+            cfg.write(stream)
+        if path.startswith(logical_home + '/'):
+            installed_path = home / Path(path).relative_to(logical_home)
+            if not installed_path.is_file():
+                candidates = sorted(p for p in (home / 'Pictures/wallpapers').iterdir()
+                    if p.is_file() and p.suffix.lower() in
+                    {'.jpg', '.jpeg', '.png', '.bmp', '.webp'})
+                if not candidates:
+                    raise SystemExit('No wallpaper images in installed user home')
+                path = logical_home + '/Pictures/wallpapers/' + candidates[0].name
+                cfg.set('last', 'wallpaper', path)
+                with wallcfg.open('w') as stream:
+                    cfg.write(stream)
+                print('  ! Missing selected wallpaper; using available image:', path)
+print('  + Rebasing installed user config paths; updated files:', changed)
+ALTUSERPATHPY
+
+    # Ensure all inherited user assets belong to the installed user.
+    chroot "$ALTERNIX_MOUNT" chown -R "${ALTERNIX_USERNAME}:${ALTERNIX_USERNAME}" \
+        "/home/${ALTERNIX_USERNAME}" || die "Failed to assign installed home ownership."
+
+    # Do not leave an ISO build marker in a real user's home directory.
+    rm -f -- "$home/.alternix-prebuilt-home"
+    ok "Prebuilt user assets installed for ${ALTERNIX_USERNAME}: sounds, wallpapers, Starship, games, icons, Qtile."
 }
 
 # ── Regenerate the initramfs for real hardware ────────────────────

@@ -857,6 +857,11 @@ if grep -Eq '^[[:space:]]*firmware-(ipw2x00|ivtv)([[:space:]]|$)' \
     config/package-lists/alternix-installer.list.chroot; then
     _die "firmware-ipw2x00 and firmware-ivtv require interactive licence acceptance; cannot install unattended."
 fi
+if [[ "$ALTERNIX_BUILD_MODE" == "live-preview" ]]; then
+    # NetworkManager uses PolicyKit/elogind for unprivileged Wi-Fi management.
+    # Keep this explicit: root Live sessions previously hid the omission.
+    printf '%s\n' polkitd >> config/package-lists/alternix-installer.list.chroot
+fi
 if [[ "$ALTERNIX_BUILD_MODE" == "net-install" ]]; then
     # Without the AlternixDE prebuild, XLibre is not installed. Provide
     # Xorg and libinput so osm-install still starts on tablets/touchscreens.
@@ -1002,6 +1007,36 @@ fi
 
 cd "$DE_DIR"
 
+# osm-launcher scans both system and user .desktop locations. The same
+# About/htop/System Update name may appear more than once (e.g. a
+# distro-provided shortcut plus our custom Alacritty entry). Patch its
+# SOURCE before compilation so both Live and copy-installed systems
+# show one tile per named application. Keep user-local entries first.
+python3 - "$DE_DIR/Alternix/apps/osm-launcher.cpp" <<'LAUNCHERDEDUPEPY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1])
+s = source.read_text()
+if 'ALTERNIX_DEDUPE_SYSTEM_APPS' not in s:
+    include = '#include <QDirIterator>'
+    start = '    QList<AppEntry> apps;'
+    append = '            apps.append({name, cleanExec(exec), icon});'
+    if s.count(include) != 1 or s.count(start) != 1 or s.count(append) != 1:
+        raise SystemExit('Cannot safely patch osm-launcher deduplication: upstream source changed')
+    s = s.replace(include, include + '\n#include <QSet>', 1)
+    s = s.replace(start, start + '\n    QSet<QString> seenSystemNames;', 1)
+    s = s.replace(append, '''            // ALTERNIX_DEDUPE_SYSTEM_APPS: first occurrence wins.
+            const QString key = name.trimmed().toCaseFolded();
+            if (key == QStringLiteral("about") ||
+                key == QStringLiteral("htop") ||
+                key == QStringLiteral("system update")) {
+                if (seenSystemNames.contains(key)) continue;
+                seenSystemNames.insert(key);
+            }
+''' + append, 1)
+    source.write_text(s)
+print('  + osm-launcher: deduplicates About, htop and System Update by display name.')
+LAUNCHERDEDUPEPY
+
 if [ ! -d "$DE_DIR/Alternix/apps" ] || [ ! -d "$DE_DIR/Alternix/configs" ]; then
     echo '  x AlternixDE repo does not contain the expected desktop source and configs.'
     exit 1
@@ -1100,20 +1135,51 @@ if ! bash /installer/onboard-defaults.sh / 30 Nightshade 1280 800; then
 fi
 echo '  + Live Onboard defaults: bottom dock, full screen width, initially hidden.'
 
-# SKEL COPY — DO NOT REMOVE
-# The build writes configs into the building user's home. The real user
-# does not exist yet — configure_system.sh creates them during the
-# install — so copying into /etc/skel is what gives whoever is created
-# later a working desktop.
-for d in .config .local/share; do
+# COMPLETE PREBUILT USER TEMPLATE — DO NOT REMOVE
+# The reference AlternixDE installer creates assets in $TARGET_HOME,
+# including wallpapers, ~/extras/games/breakout.html, sounds, launchers,
+# shell customisation, Qtile configs and per-user helper scripts. Since
+# the build-time account is root, useradd -m needs ALL of these in skel.
+# Only include user-facing assets; NEVER copy root credentials or history.
+for d in .config .local/share .local/bin .icons Pictures/wallpapers extras; do
     if [ -d "${HOME}/${d}" ]; then
         mkdir -p "/etc/skel/${d}"
-        cp -a "${HOME}/${d}/." "/etc/skel/${d}/" 2>/dev/null || true
+        cp -a "${HOME}/${d}/." "/etc/skel/${d}/"
     fi
 done
-
-# The Live user's desktop shortcuts and wallpaper were copied from root
-# above; installed users continue to receive the unmodified /etc/skel.
+if [ -f "${HOME}/.alacritty.toml" ]; then
+    cp -a "${HOME}/.alacritty.toml" /etc/skel/.alacritty.toml
+fi
+# The installer added Starship to root's .bashrc, but the installed
+# account starts with its own .bashrc; supply just the required line.
+if ! grep -Fqx 'eval "$(starship init bash)"' /etc/skel/.bashrc 2>/dev/null; then
+    printf '%s\n' 'eval "$(starship init bash)"' >> /etc/skel/.bashrc
+fi
+# Fail at build time if the image is incomplete, not after erasing disks.
+for required in \
+        .config/qtile/config.py \
+        .config/Alternix/sounds \
+        .local/share/applications/breakout.desktop \
+        Pictures/wallpapers \
+        extras/games/breakout.html \
+        .alacritty.toml; do
+    [ -e "/etc/skel/$required" ] || {
+        echo "  x Incomplete prebuilt user template: $required missing"
+        exit 1
+    }
+done
+find /etc/skel/Pictures/wallpapers -maxdepth 1 -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) \
+    -print -quit | grep -q . || {
+        echo '  x Prebuilt user template contains no wallpaper image.'
+        exit 1
+    }
+command -v starship >/dev/null 2>&1 || {
+    echo '  x Starship missing from prebuilt image.'
+    exit 1
+}
+printf 'alternix-home-template-v1\n' > /etc/skel/.alternix-prebuilt-home
+printf '  + Complete prebuilt home template ready (wallpapers, sounds, games, scripts, Starship).\n'
 
 # SUDOERS CLEANUP — DO NOT REMOVE
 # install-alternix_devuan.sh:66 writes a permanent NOPASSWD rule so its
@@ -1206,7 +1272,7 @@ chmod -R a+rX /opt/alternix-live
 # The desktop installer writes configuration to the building root user's
 # home, and wallpapers separately to ~/Pictures (not /etc/skel).
 # Copy both, so the preview has the same background as an installed user.
-for item in .config .local/bin .local/share .alacritty.toml Pictures/wallpapers extras; do
+for item in .config .local/bin .local/share .icons .alacritty.toml Pictures/wallpapers extras; do
     if [ -d "/root/$item" ]; then
         mkdir -p "$LIVE_HOME/$item"
         cp -a "/root/$item/." "$LIVE_HOME/$item/"
@@ -1302,6 +1368,22 @@ cat > "$LIVE_HOME/.bash_profile" <<'LIVEUSERPROFILE'
 LIVEUSERPROFILE
 chown "$LIVE_NAME:$LIVE_NAME" "$LIVE_HOME/.bash_profile"
 chmod 644 "$LIVE_HOME/.bash_profile"
+# osm-power uses osm-sudo, which performs the Alternix pattern/PIN check
+# before calling sudo -S. The old unrestricted build-time NOPASSWD rule
+# was intentionally removed. Permit only reboot and poweroff; sudo -S can
+# then run without an OS password, even for the password-locked Live user.
+# The installed system replaces this temporary policy with the %sudo-only
+# version in configure_system.sh (no alternix-live account retained).
+cat > /etc/sudoers.d/90-alternix-power <<'LIVEPOWERSUDO'
+Cmnd_Alias ALTERNIX_POWER_CMDS = /usr/sbin/reboot, /usr/sbin/poweroff, /sbin/reboot, /sbin/poweroff
+%sudo ALL=(root) NOPASSWD: ALTERNIX_POWER_CMDS
+alternix-live ALL=(root) NOPASSWD: ALTERNIX_POWER_CMDS
+LIVEPOWERSUDO
+chmod 0440 /etc/sudoers.d/90-alternix-power
+visudo -cf /etc/sudoers.d/90-alternix-power >/dev/null || {
+    echo '  x The restricted Live reboot/poweroff sudoers policy is invalid.'
+    exit 1
+}
 # The installed-system .xinitrc/.bash_profile in /etc/skel stay unchanged.
 # Only osm-install is permitted to elevate; no ALL-commands NOPASSWD.
 cat >/etc/sudoers.d/alternix-live-installer <<'LIVESUDO'
@@ -1312,15 +1394,91 @@ chmod 440 /etc/sudoers.d/alternix-live-installer
 if command -v visudo >/dev/null 2>&1; then
     visudo -cf /etc/sudoers.d/alternix-live-installer >/dev/null || exit 1
 fi
-mkdir -p "$LIVE_HOME/.local/share/applications"
+# The Alternix app launcher scans BOTH /usr/share/applications and
+# ~/.local/share/applications without desktop-ID deduplication. Giving the
+# Live account local copies while leaving system entries causes the observed
+# duplicate About, htop and System Update tiles. Move only those 3 global
+# entries to a non-scanned staging directory, then create exactly one local
+# Live launcher for each. Restore originals during copy-install.
+mkdir -p "$LIVE_HOME/.local/share/applications" /usr/share/alternix/live-original-launchers
 for app in htop fetch os-check-update; do
-    if [ -f "/usr/share/applications/$app.desktop" ]; then
+    system_desktop="/usr/share/applications/$app.desktop"
+    original="/usr/share/alternix/live-original-launchers/$app.desktop"
+    if [ -f "$system_desktop" ]; then
+        mv "$system_desktop" "$original"
         sed -e 's|^Exec=alacritty -e |Exec=/usr/local/bin/alternix-live-terminal -e |' \
             -e 's|^Terminal=true|Terminal=false|' \
-            "/usr/share/applications/$app.desktop" > "$LIVE_HOME/.local/share/applications/$app.desktop"
+            "$original" > "$LIVE_HOME/.local/share/applications/$app.desktop"
     fi
 done
+# Expand stale absolute /root icon paths in the copied user's launchers.
+# Icon=foo (theme names) are intentionally preserved for Qt theme lookup.
+python3 - "$LIVE_HOME" <<'LIVEICONPY'
+from pathlib import Path
+import sys
+home = Path(sys.argv[1]); apps = home / '.local/share/applications'
+for desktop in apps.rglob('*.desktop'):
+    try:
+        lines = desktop.read_text().splitlines(keepends=True)
+    except (OSError, UnicodeError):
+        continue
+    new = []
+    for line in lines:
+        if line.startswith('Icon=/root/'):
+            line = 'Icon=' + str(home) + '/' + line[len('Icon=/root/'):]
+        elif line.startswith('Icon=~/'):
+            line = 'Icon=' + str(home) + '/' + line[len('Icon=~/'):]
+        new.append(line)
+    if new != lines:
+        desktop.write_text(''.join(new))
+LIVEICONPY
+# A stale/missing theme cache and flatpak icon directories can cause Qt's
+# QIcon::fromTheme() to show its puzzle-piece fallback in osm-launcher.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
 chown -R "$LIVE_NAME:$LIVE_NAME" "$LIVE_HOME/.local/share/applications"
+
+# Wi-Fi requires NetworkManager authorization, not full administrative access.
+# Limit unattended grants to an ACTIVE LOCAL Live session, to NetworkManager's
+# Wi-Fi/connection actions only; the temporary rule is deleted on installation.
+mkdir -p /etc/polkit-1/rules.d
+cat >/etc/polkit-1/rules.d/49-alternix-live-network.rules <<'LIVEWIFIPOLKIT'
+polkit.addRule(function(action, subject) {
+    if (subject.user !== "alternix-live" || !subject.local || !subject.active)
+        return;
+    var actions = [
+        "org.freedesktop.NetworkManager.wifi.scan",
+        "org.freedesktop.NetworkManager.network-control",
+        "org.freedesktop.NetworkManager.enable-disable-wifi",
+        "org.freedesktop.NetworkManager.settings.modify.own",
+        "org.freedesktop.NetworkManager.settings.modify.system"
+    ];
+    if (actions.indexOf(action.id) !== -1)
+        return polkit.Result.YES;
+});
+LIVEWIFIPOLKIT
+chmod 644 /etc/polkit-1/rules.d/49-alternix-live-network.rules
+
+# Older Alternix wireless scanners may invoke sudo for a literal scan
+# command rather than delegating through NetworkManager. Grant ONLY scan
+# subcommands, never general root, shells, or unrestricted nmcli/iw.
+cat >/etc/sudoers.d/alternix-live-wifi-scan <<'LIVEWIFISUDO'
+alternix-live ALL=(root) NOPASSWD: /usr/sbin/iwlist * scan, /usr/bin/iwlist * scan
+alternix-live ALL=(root) NOPASSWD: /usr/sbin/iw dev * scan, /usr/bin/iw dev * scan
+alternix-live ALL=(root) NOPASSWD: /usr/bin/nmcli device wifi rescan, /usr/bin/nmcli dev wifi rescan
+LIVEWIFISUDO
+chmod 440 /etc/sudoers.d/alternix-live-wifi-scan
+if command -v visudo >/dev/null 2>&1; then
+    visudo -cf /etc/sudoers.d/alternix-live-wifi-scan >/dev/null || exit 1
+fi
+# Do not conceal an absent NetworkManager; it must run on the Live system.
+if ! command -v nmcli >/dev/null 2>&1; then
+    echo '  x NetworkManager/nmcli missing from live image.'
+    exit 1
+fi
+printf '  + Live network permissions scoped to NetworkManager and Wi-Fi scan.\n'
+
 echo '  + Unprivileged Live user ready (private desktop, shared Qtile venv, scoped installer elevation).'
 
 # The desktop installer initially links this path to root's private venv.
@@ -1557,6 +1715,9 @@ export HOME=/home/alternix-live
 export XDG_CONFIG_HOME="$HOME/.config"
 export XDG_CACHE_HOME="$HOME/.cache"
 export XDG_DATA_HOME="$HOME/.local/share"
+# Flatpak icons and system themes were invisible to Qt's icon-theme lookup
+# when the desktop was started directly through startx rather than a DM.
+export XDG_DATA_DIRS="/var/lib/flatpak/exports/share:$HOME/.local/share/flatpak/exports/share:/usr/local/share:/usr/share"
 export PATH=/opt/alternix-live/qtile_venv/bin:/usr/local/bin:/usr/bin:/bin
 cd "$HOME" || exit 1
 [ -x /opt/alternix-live/qtile_venv/bin/qtile ] || {
@@ -1672,20 +1833,43 @@ fi
 /usr/local/bin/osm-paper-restore
 LIVEPAPERRESTOREEOF
 chmod +x config/includes.chroot/usr/local/bin/alternix-live-wallpaper
-# No-OpenGL fallback for the upstream Alacritty-only console apps. Only
-# the live user's local desktop files call this wrapper.
+# Live-only Alacritty renderer probe + xterm fallback for terminal apps.
+# Startup failures are recorded, and a failing command is never re-run.
 cat > config/includes.chroot/usr/local/bin/alternix-live-terminal <<'LIVETERMINALEOF'
 #!/bin/sh
+# The three terminal app launchers all use this ONE launcher. Check the
+# terminal itself before running the requested command; never re-run an
+# updater/system command merely because its child exits with an error.
 [ "${1:-}" = -e ] && shift
 [ "$#" -gt 0 ] || exit 2
-if command -v alacritty >/dev/null 2>&1; then
-    alacritty -e "$@" && exit 0
+mkdir -p "$HOME/.cache"
+log="$HOME/.cache/alternix-live-alacritty.log"
+probe_ok="$HOME/.cache/alternix-live-alacritty-ok"
+probe_fail="$HOME/.cache/alternix-live-alacritty-failed"
+# Software OpenGL ONLY inside VMs whose virtual graphics driver can fail
+# Alacritty initialization. Keep normal GPU acceleration on real machines.
+if grep -Eiq 'virtualbox|vmware' /sys/class/dmi/id/product_name 2>/dev/null; then
+    export LIBGL_ALWAYS_SOFTWARE=1
 fi
-# VirtualBox and older tablet GPUs may not expose suitable OpenGL.
+if command -v alacritty >/dev/null 2>&1 && [ ! -e "$probe_fail" ]; then
+    if [ ! -e "$probe_ok" ]; then
+        if timeout 12 alacritty -e /bin/true >"$log" 2>&1; then
+            : >"$probe_ok"
+        else
+            code=$?
+            printf 'Alacritty window startup failed (exit %s); using Xterm fallback.\n' "$code" >>"$log"
+            : >"$probe_fail"
+        fi
+    fi
+    if [ -e "$probe_ok" ]; then
+        alacritty -e "$@" 2>>"$log"
+        exit $?
+    fi
+fi
 if command -v xterm >/dev/null 2>&1; then
     exec xterm -e "$@"
 fi
-printf 'No working terminal emulator for %s\n' "$1" >&2
+printf 'No working terminal emulator for %s (see %s)\n' "$1" "$log" >&2
 exit 1
 LIVETERMINALEOF
 chmod +x config/includes.chroot/usr/local/bin/alternix-live-terminal

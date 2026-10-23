@@ -806,7 +806,7 @@ public:
 
         const QStringList steps = {
             QStringLiteral("Detect your hardware"),
-            QStringLiteral("Connect to the internet"),
+            QStringLiteral("Connect to a network (optional for prebuilt Alternix)"),
             QStringLiteral("Collect your preferences"),
             QStringLiteral("Partition and format your disk"),
             QStringLiteral("Install Devuan base (no systemd)"),
@@ -821,8 +821,8 @@ public:
 
         body()->addSpacing(10);
         body()->addWidget(mkLabel(
-            QStringLiteral("Estimated time: 30-50 minutes.\n"
-                           "Requires an internet connection and 8 GB of free disk space."),
+            QStringLiteral("Prebuilt Alternix can be installed offline from Live-preview.\n"
+                           "Other desktops require an Internet connection."),
             15, FG_DIM));
         body()->addStretch(1);
 
@@ -978,9 +978,13 @@ class NetworkPage : public Page {
 public:
     NetworkPage(std::function<void()> back, std::function<void()> next)
         : Page(QStringLiteral("Network"),
-               QStringLiteral("Alternix downloads its packages during install, "
-                              "so a connection is required.")) {
+               QStringLiteral("For live-preview, the prebuilt Alternix desktop "
+                              "can be installed without Internet. Other desktops "
+                              "and online extras still need a connection.")) {
         m_next = next;
+        m_allowOffline = readFileTrimmed(QStringLiteral("/etc/alternix/iso-mode")) ==
+            QStringLiteral("live-preview") &&
+            !readFileTrimmed(QStringLiteral("/etc/alternix/de-baked")).isEmpty();
 
         m_status = mkLabel(QStringLiteral("Checking..."), 16, FG_DIM);
         body()->addWidget(m_status);
@@ -1029,7 +1033,8 @@ public:
 
         m_backBtn = mkButton(QStringLiteral("Back"));
         m_nextBtn = mkButton(QStringLiteral("Next"), true);
-        m_nextBtn->setEnabled(false);
+        m_nextBtn->setEnabled(m_allowOffline);
+        if (m_allowOffline) m_nextBtn->setText(QStringLiteral("Next (offline OK)"));
         QObject::connect(m_backBtn, &QPushButton::clicked, this, back);
         QObject::connect(m_nextBtn, &QPushButton::clicked, this, next);
         footer()->addWidget(m_backBtn);
@@ -1152,12 +1157,16 @@ private:
 
     void setConnected(bool ok) {
         g_ans.netConnected = ok;
-        m_nextBtn->setEnabled(ok);
+        m_nextBtn->setEnabled(ok || m_allowOffline);
+        m_nextBtn->setText((!ok && m_allowOffline)
+            ? QStringLiteral("Next (offline OK)") : QStringLiteral("Next"));
         if (ok) {
             m_status->setText(QStringLiteral("Connected."));
             m_status->setStyleSheet(QString("color: %1; font-size: 16px;").arg(OKGREEN));
         } else {
-            m_status->setText(QStringLiteral("Not connected."));
+            m_status->setText(m_allowOffline
+                ? QStringLiteral("Offline: you may install the prebuilt Alternix desktop now.")
+                : QStringLiteral("Not connected. Connect to continue."));
             m_status->setStyleSheet(QString("color: %1; font-size: 16px;").arg(FG_DIM));
         }
     }
@@ -1255,6 +1264,7 @@ private:
     }
 
     QLabel      *m_status     = nullptr;
+    bool m_allowOffline = false;
     QComboBox   *m_ifaceBox   = nullptr;
     QPushButton *m_scanBtn    = nullptr;
     QListWidget *m_ssidList   = nullptr;
@@ -2577,6 +2587,19 @@ private:
     }
 
     void beginInstall() {
+        // Guard before partitioning: only the baked Alternix desktop
+        // (without online optional components) is supported offline.
+        if (!g_ans.netConnected &&
+            (readFileTrimmed(QStringLiteral("/etc/alternix/iso-mode")) !=
+                 QStringLiteral("live-preview") ||
+             g_ans.desktop != QStringLiteral("alternix") ||
+             !g_ans.optional.isEmpty())) {
+            QMessageBox::warning(this, QStringLiteral("Internet required"),
+                QStringLiteral("Offline installation is available for prebuilt "
+                               "Alternix without optional downloads. Go back "
+                               "and choose Alternix, or connect to the Internet."));
+            return;
+        }
         QString err;
         if (!writeConf(&err)) {
             QMessageBox::critical(this, QStringLiteral("Error"), err);

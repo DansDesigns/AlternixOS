@@ -347,10 +347,22 @@ banner
 # network scan nor online time-sync. The GUI can set up Wi-Fi separately;
 # installed NetworkManager lets the user connect after first boot.
 # Other desktops and selected optional network components retain networking.
+# GUI cannot answer an interactive network prompt, so fail before erasure if
+# an online-only selection has no connection. Prebuilt Alternix is exempt.
+if [[ "${ALTERNIX_UNATTENDED:-0}" -eq 1 ]] && \
+   { [[ "${ALTERNIX_DESKTOP:-}" != alternix ]] || \
+     [[ -n "${ALTERNIX_OPTIONAL:-}" ]] || \
+     [[ "${ALTERNIX_TELEPHONY:-2}" != 2 ]] || \
+     [[ "$(cat /etc/alternix/iso-mode 2>/dev/null)" != live-preview ]]; }; then
+    if ! timeout 10 bash "${INSTALLER_DIR}/alternix-net" status >/dev/null 2>&1; then
+        die "This selection needs Internet. Offline installation is supported for prebuilt Alternix without optional downloads."
+    fi
+fi
 if [[ "${ALTERNIX_UNATTENDED:-0}" -eq 1 && \
       "${ALTERNIX_DESKTOP:-}" == alternix && \
       -s /etc/alternix/de-baked && \
-      -z "${ALTERNIX_OPTIONAL:-}" ]]; then
+      -z "${ALTERNIX_OPTIONAL:-}" && \
+      "${ALTERNIX_TELEPHONY:-2}" == 2 ]]; then
     info "Prebuilt image install: skipping unnecessary network downloads and scanning."
 else
     setup_network
@@ -391,8 +403,21 @@ if [[ "${ALTERNIX_DESKTOP:-}" == "alternix" && "${ALTERNIX_FORCE_DEBOOTSTRAP:-0}
                [[ ! -x /usr/local/bin/osm-launcher ]]; then
                 die "Live-preview desktop was not fully prebuilt. Refusing to erase the disk."
             fi
+            # The image must include the user assets in /etc/skel, not
+            # just system binaries in /usr/local/bin. Refuse to erase a
+            # disk if the root-built home wasn't staged for new users.
+            for required in \
+                .alternix-prebuilt-home \
+                .config/qtile/config.py \
+                .config/Alternix/sounds \
+                .local/share/applications/breakout.desktop \
+                Pictures/wallpapers \
+                extras/games/breakout.html; do
+                [[ -e "/etc/skel/$required" ]] || \
+                    die "Incomplete live-preview user assets: /etc/skel/$required is missing."
+            done
             ALTERNIX_PREBUILT_INSTALL=1
-            info "Prebuilt AlternixDE detected: installation will copy the ready-to-run OS."
+            info "Prebuilt AlternixDE and complete user assets detected; offline copy installation available."
             ;;
         net-install)
             info "Net-install: AlternixDE will be cloned from GitHub after the base system is copied."
@@ -478,6 +503,15 @@ banner
 progress_set 7 "Configuring"
 banner
 configure_system
+
+# The ISO was baked using root as a temporary build account. Make the
+# prebuilt user's files portable to the actual chosen installed account.
+# No git, network, apt or new software compilation is needed here.
+if [[ "${ALTERNIX_PREBUILT_INSTALL:-0}" -eq 1 &&
+      "${ALTERNIX_COPY_INSTALL:-0}" -eq 1 &&
+      "${ALTERNIX_DESKTOP:-}" == alternix ]]; then
+    personalise_prebuilt_home
+fi
 
 # ════════════════════════════════════════════════════════════════
 # STAGE 9b: Desktop Environment
