@@ -982,9 +982,10 @@ public:
                               "can be installed without Internet. Other desktops "
                               "and online extras still need a connection.")) {
         m_next = next;
+        // An offline path is offered by every live-preview ISO. Check
+        // the prebuilt desktop marker before disk erasure, not on this page.
         m_allowOffline = readFileTrimmed(QStringLiteral("/etc/alternix/iso-mode")) ==
-            QStringLiteral("live-preview") &&
-            !readFileTrimmed(QStringLiteral("/etc/alternix/de-baked")).isEmpty();
+            QStringLiteral("live-preview");
 
         m_status = mkLabel(QStringLiteral("Checking..."), 16, FG_DIM);
         body()->addWidget(m_status);
@@ -1029,12 +1030,16 @@ public:
 
         m_connectBtn = mkButton(QStringLiteral("Connect"), true);
         body()->addWidget(m_connectBtn);
+        // Explicitly visible in Live-preview, including when Wi-Fi fails.
+        m_offlineBtn = mkButton(QStringLiteral("Continue without network"));
+        body()->addWidget(m_offlineBtn);
+        m_offlineBtn->setVisible(m_allowOffline);
         body()->addStretch(1);
 
         m_backBtn = mkButton(QStringLiteral("Back"));
         m_nextBtn = mkButton(QStringLiteral("Next"), true);
         m_nextBtn->setEnabled(m_allowOffline);
-        if (m_allowOffline) m_nextBtn->setText(QStringLiteral("Next (offline OK)"));
+        if (m_allowOffline) m_nextBtn->setText(QStringLiteral("Next (offline available)"));
         QObject::connect(m_backBtn, &QPushButton::clicked, this, back);
         QObject::connect(m_nextBtn, &QPushButton::clicked, this, next);
         footer()->addWidget(m_backBtn);
@@ -1045,6 +1050,13 @@ public:
                          [this]() { doScan(); });
         QObject::connect(m_connectBtn, &QPushButton::clicked, this,
                          [this]() { doConnect(); });
+        QObject::connect(m_offlineBtn, &QPushButton::clicked, this, [this]() {
+            g_ans.netConnected = false;
+            g_ans.netIface.clear();
+            g_ans.netSsid.clear();
+            m_psk->clear();
+            m_next();
+        });
         QObject::connect(m_ifaceBox,
                          QOverload<int>::of(&QComboBox::currentIndexChanged), this,
                          [this](int) { m_psk->clear(); updateWifiControls(); });
@@ -1159,7 +1171,7 @@ private:
         g_ans.netConnected = ok;
         m_nextBtn->setEnabled(ok || m_allowOffline);
         m_nextBtn->setText((!ok && m_allowOffline)
-            ? QStringLiteral("Next (offline OK)") : QStringLiteral("Next"));
+            ? QStringLiteral("Next (offline available)") : QStringLiteral("Next"));
         if (ok) {
             m_status->setText(QStringLiteral("Connected."));
             m_status->setStyleSheet(QString("color: %1; font-size: 16px;").arg(OKGREEN));
@@ -1232,9 +1244,12 @@ private:
             }
 
             setConnected(false);
-            const QString detail = r.err.trimmed().isEmpty()
-                                       ? QStringLiteral("Connection failed.")
-                                       : r.err.trimmed().section('\n', -1);
+            // Keep NetworkManager's actual error, rather than showing only
+            // the final (generic) line and wrongly blaming the password.
+            const QStringList errors = r.err.trimmed().split('\n', Qt::SkipEmptyParts);
+            const QString detail = errors.isEmpty()
+                ? QStringLiteral("Connection failed.")
+                : errors.mid(qMax(0, errors.size() - 5)).join('\n');
             m_status->setText(detail);
             m_status->setStyleSheet(
                 QString("color: %1; font-size: 16px;").arg(DANGER));
@@ -1250,8 +1265,9 @@ private:
             } else if (wifi) {
                 advice = QStringLiteral(
                     "Could not connect to \"%1\".\n\n"
-                    "The most likely cause is an incorrect password. "
-                    "Use Show to check what you typed, then try again.\n\n"
+                    "A failure does not necessarily mean your password is wrong. "
+                    "The Wi-Fi driver, security mode, DHCP or network "
+                    "service may be responsible.\n\n"
                     "%2").arg(ssid, detail);
             } else {
                 advice = QStringLiteral(
@@ -1271,6 +1287,7 @@ private:
     QLineEdit   *m_psk        = nullptr;
     QWidget     *m_pskRow     = nullptr;
     QPushButton *m_connectBtn = nullptr;
+    QPushButton *m_offlineBtn = nullptr;
     QPushButton *m_backBtn    = nullptr;
     QPushButton *m_nextBtn    = nullptr;
     std::function<void()> m_next;
@@ -1935,10 +1952,11 @@ public:
                optNames.isEmpty() ? QStringLiteral("None")
                                   : optNames.join(QStringLiteral(", ")));
         addRow(QStringLiteral("Network"),
-               g_ans.netSsid.isEmpty()
+               !g_ans.netConnected ? QStringLiteral("Offline (prebuilt install)") :
+               (g_ans.netSsid.isEmpty()
                    ? (g_ans.netIface.isEmpty() ? QStringLiteral("Already connected")
                                                : g_ans.netIface)
-                   : g_ans.netSsid);
+                   : g_ans.netSsid));
     }
 
 private:
@@ -2592,12 +2610,17 @@ private:
         if (!g_ans.netConnected &&
             (readFileTrimmed(QStringLiteral("/etc/alternix/iso-mode")) !=
                  QStringLiteral("live-preview") ||
+             readFileTrimmed(QStringLiteral("/etc/alternix/de-baked")).isEmpty() ||
+             QFile::exists(QStringLiteral("/etc/alternix/de-missing")) ||
+             !QFile::exists(QStringLiteral("/usr/local/bin/osm-launcher")) ||
              g_ans.desktop != QStringLiteral("alternix") ||
              !g_ans.optional.isEmpty())) {
             QMessageBox::warning(this, QStringLiteral("Internet required"),
-                QStringLiteral("Offline installation is available for prebuilt "
-                               "Alternix without optional downloads. Go back "
-                               "and choose Alternix, or connect to the Internet."));
+                QStringLiteral("Offline installation requires a complete "
+                               "live-preview ISO, the prebuilt Alternix desktop "
+                               "and no online optional components. Check your "
+                               "desktop and optional choices. If the prebuilt "
+                               "image is missing, the ISO must be rebuilt."));
             return;
         }
         QString err;
