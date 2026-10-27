@@ -175,7 +175,7 @@ EOF
         "firmware-brcm80211" "bluez-firmware" "firmware-intel-sound"
         "e2fsprogs" "dosfstools" "parted"
         "ca-certificates" "locales" "tzdata"
-        "sudo" "openssh-client" "nano" "htop" "pciutils"
+        "sudo" "openssh-client" "nano" "htop" "pciutils" "nala"
     )
 
     if [[ "$HW_ARCH" == "aarch64" ]]; then

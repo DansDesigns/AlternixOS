@@ -416,6 +416,14 @@ if [[ "${ALTERNIX_DESKTOP:-}" == "alternix" && "${ALTERNIX_FORCE_DEBOOTSTRAP:-0}
                 [[ -e "/etc/skel/$required" ]] || \
                     die "Incomplete live-preview user assets: /etc/skel/$required is missing."
             done
+            # Do not erase a tablet if the ISO itself lacks Nala: an
+            # offline squashfs copy could never download it afterwards.
+            if ! dpkg-query -W -f='${Status}' nala 2>/dev/null | \
+                    grep -qx 'install ok installed' || \
+               ! command -v nala >/dev/null 2>&1 || \
+               ! nala --version >/dev/null 2>&1; then
+                die "This Live ISO lacks a working Nala package; System Update would fail on the installed OS. Rebuild the ISO."
+            fi
             ALTERNIX_PREBUILT_INSTALL=1
             info "Prebuilt AlternixDE and complete user assets detected; offline copy installation available."
             ;;
@@ -606,6 +614,16 @@ if [[ "$USE_EFI" -eq 1 ]]; then
     [[ -f "${ALTERNIX_MOUNT}/boot/efi/EFI/BOOT/BOOTIA32.EFI" || \
        -f "${ALTERNIX_MOUNT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || \
         die "No EFI fallback loader found on the installed EFI partition."
+fi
+# Verify the actual INSTALLED filesystem, not the Live host. Nala must
+# be available even when installation was performed without a network.
+if [[ "${ALTERNIX_DESKTOP:-}" == "alternix" ]]; then
+    if ! chroot "$ALTERNIX_MOUNT" dpkg-query -W -f='${Status}' nala 2>/dev/null | \
+            grep -qx 'install ok installed' || \
+       ! chroot "$ALTERNIX_MOUNT" /usr/bin/nala --version >/dev/null 2>&1; then
+        die "Nala is missing or cannot start on the installed AlternixOS system. Refusing to report a successful installation."
+    fi
+    ok "Installed AlternixOS: Nala present and runnable (offline-ready)."
 fi
 info "Boot verification: root UUID=${root_uuid}; GRUB and fstab agree."
 

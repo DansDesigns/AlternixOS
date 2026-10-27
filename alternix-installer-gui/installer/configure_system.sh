@@ -339,6 +339,34 @@ EOF
 }
 
 _configure_network() {
+    # NETWORKMANAGER WIFI CARRYOVER (Live preview -> installed system).
+    # alternix-net writes a working, root-owned NM keyfile only after a
+    # successful Wi-Fi connection. The installed rootfs is unpacked from the
+    # original squashfs, NOT the live overlay: copy the LIVE profile now.
+    # This retains WPA2, WPA3-SAE and open-network settings unchanged.
+    local nm_live_dir="/etc/NetworkManager/system-connections"
+    local nm_target_dir="${ALTERNIX_MOUNT}/etc/NetworkManager/system-connections"
+    local nm_file nm_count=0
+    if [[ -d "$nm_live_dir" ]]; then
+        for nm_file in "$nm_live_dir"/alternix-installer-*.nmconnection; do
+            [[ -f "$nm_file" && ! -L "$nm_file" ]] || continue
+            # Only copy Wi-Fi profiles created by the Alternix setup flow.
+            grep -Eq '^[[:space:]]*type=wifi[[:space:]]*$' "$nm_file" || continue
+            install -d -o root -g root -m 0700 "$nm_target_dir" || return 1
+            if ! install -o root -g root -m 0600 "$nm_file" \
+                    "$nm_target_dir/$(basename "$nm_file")"; then
+                err "Could not transfer the working Wi-Fi connection to the installed system."
+                return 1
+            fi
+            nm_count=$((nm_count + 1))
+        done
+    fi
+    if (( nm_count > 0 )); then
+        ok "Transferred ${nm_count} NetworkManager Wi-Fi profile(s); auto-connect retained."
+    else
+        info "No installer-created NetworkManager Wi-Fi profile to transfer (offline or legacy network setup)."
+    fi
+
     # Copy wpa_supplicant config from live env to installed system
     # so WiFi auto-connects on boot
     local wpa_src="/etc/wpa_supplicant/wpa_supplicant.conf"
@@ -356,8 +384,11 @@ _configure_network() {
         for f in /etc/wpa_supplicant/wpa_supplicant-*.conf; do
             [[ -f "$f" ]] && cp "$f" "${ALTERNIX_MOUNT}/etc/wpa_supplicant/" && found=1
         done
-        [[ $found -eq 1 ]] && ok "WiFi config transferred." || \
-            info "No wpa_supplicant config found — WiFi will need manual setup."
+        if [[ $found -eq 1 ]]; then
+            ok "Legacy WiFi config transferred."
+        elif (( nm_count == 0 )); then
+            info "No installer Wi-Fi credentials to transfer; networking can be configured after boot."
+        fi
     fi
 
     # ═══════════════════════════════════════════════════════════
@@ -376,7 +407,7 @@ EOF
 
     # Convert install-time WiFi credentials into an NM connection profile
     local wpa_conf="/etc/wpa_supplicant/wpa_supplicant.conf"
-    if [[ -f "$wpa_conf" ]]; then
+    if (( nm_count == 0 )) && [[ -f "$wpa_conf" ]]; then
         local nm_ssid nm_psk
         nm_ssid=$(grep -m1 -oP '(?<=ssid=").*(?=")' "$wpa_conf" 2>/dev/null)
         # wpa_passphrase writes the 64-hex PSK on the psk= line; NM accepts it

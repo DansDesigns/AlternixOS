@@ -762,6 +762,10 @@ ntfs-3g
 # Required for the AlternixDE prebuild and later installed system.
 sudo
 
+# The copy-installed updater uses Nala. It must be inside the Live
+# SquashFS, not installed later using an unavailable offline network.
+nala
+
 # ── Build tools ───────────────────────────────────────────────────
 # seL4 has been dropped, so cmake, ninja-build, device-tree-compiler,
 # gnu-efi, python3-yaml, python3-jinja2, python3-ply, python3-lxml
@@ -882,7 +886,16 @@ _step "Embedding installer scripts"
 
 mkdir -p config/includes.chroot/installer config/includes.chroot/etc/alternix
 printf '%s\n' "$ALTERNIX_BUILD_MODE" > config/includes.chroot/etc/alternix/iso-mode
-cp -r "${SCRIPT_DIR}/installer/"* config/includes.chroot/installer/
+# This project owns only the ISO installer. The desktop install script is
+# owned by AlternixDE and MUST NEVER be embedded as a stale local override.
+# Exclude it even if someone has kept an old copy in installer/.
+for installer_source in "${SCRIPT_DIR}/installer/"*; do
+    [[ -e "$installer_source" ]] || continue
+    [[ "${installer_source##*/}" == "install-alternix_devuan.sh" ]] && continue
+    cp -a -- "$installer_source" config/includes.chroot/installer/
+done
+# Also discard any stale generated copy from an earlier interrupted build.
+rm -f config/includes.chroot/installer/install-alternix_devuan.sh
 chmod +x config/includes.chroot/installer/*.sh
 
 _ok "Installer scripts embedded."
@@ -1007,52 +1020,27 @@ fi
 
 cd "$DE_DIR"
 
-# osm-launcher scans both system and user .desktop locations. The same
-# About/htop/System Update name may appear more than once (e.g. a
-# distro-provided shortcut plus our custom Alacritty entry). Patch its
-# SOURCE before compilation so both Live and copy-installed systems
-# show one tile per named application. Keep user-local entries first.
-python3 - "$DE_DIR/Alternix/apps/osm-launcher.cpp" <<'LAUNCHERDEDUPEPY'
-import pathlib, sys
-source = pathlib.Path(sys.argv[1])
-s = source.read_text()
-if 'ALTERNIX_DEDUPE_SYSTEM_APPS' not in s:
-    include = '#include <QDirIterator>'
-    start = '    QList<AppEntry> apps;'
-    append = '            apps.append({name, cleanExec(exec), icon});'
-    if s.count(include) != 1 or s.count(start) != 1 or s.count(append) != 1:
-        raise SystemExit('Cannot safely patch osm-launcher deduplication: upstream source changed')
-    s = s.replace(include, include + '\n#include <QSet>', 1)
-    s = s.replace(start, start + '\n    QSet<QString> seenSystemNames;', 1)
-    s = s.replace(append, '''            // ALTERNIX_DEDUPE_SYSTEM_APPS: first occurrence wins.
-            const QString key = name.trimmed().toCaseFolded();
-            if (key == QStringLiteral("about") ||
-                key == QStringLiteral("htop") ||
-                key == QStringLiteral("system update")) {
-                if (seenSystemNames.contains(key)) continue;
-                seenSystemNames.insert(key);
-            }
-''' + append, 1)
-    source.write_text(s)
-print('  + osm-launcher: deduplicates About, htop and System Update by display name.')
-LAUNCHERDEDUPEPY
+# AlternixOS must never rewrite AlternixDE app source files during ISO
+# creation. Launcher deduplication and other desktop changes belong upstream
+# in the AlternixDE repository itself.
 
 if [ ! -d "$DE_DIR/Alternix/apps" ] || [ ! -d "$DE_DIR/Alternix/configs" ]; then
     echo '  x AlternixDE repo does not contain the expected desktop source and configs.'
     exit 1
 fi
 
-# Run the exact APT-only AlternixDE installer supplied with this ISO
-# builder. Do not parse, sed-rewrite, or substitute package-manager
-# commands from the cloned repository: command-shape assumptions caused
-# repeated builds to fail before even attempting the desktop.
-if [ ! -s /installer/install-alternix_devuan.sh ]; then
-    echo '  x Bundled AlternixDE installer is missing from /installer.'
+# Use the installer provided by the newly cloned AlternixDE repository.
+# NEVER overwrite it from this ISO project, convert its line endings, or
+# otherwise rewrite source-controlled files. This preserves DE clock/sudo
+# changes across independent AlternixOS builds.
+if [ ! -s "$DE_DIR/install-alternix_devuan.sh" ]; then
+    echo '  x Current AlternixDE checkout has no install-alternix_devuan.sh.'
     exit 1
 fi
-cp -f /installer/install-alternix_devuan.sh "$DE_DIR/install-alternix_devuan.sh"
-sed -i 's/\r$//' "$DE_DIR/install-alternix_devuan.sh"
-chmod +x "$DE_DIR/install-alternix_devuan.sh"
+if ! bash -n "$DE_DIR/install-alternix_devuan.sh"; then
+    echo '  x AlternixDE installer syntax invalid; fix it in the DE repository.'
+    exit 1
+fi
 
 # The desktop installer cleans up its source tree during installation.
 # Stash the repository BEFORE running it so copy-installed systems still
@@ -1194,6 +1182,15 @@ if [ ! -f /usr/share/alternix/AlternixDE/install-alternix_devuan.sh ]; then
     exit 1
 fi
 echo '  + AlternixDE source retained for copy-installed systems.'
+
+# Nala must actually be present inside the image that is later copied
+# to installed devices; testing only the build host is not sufficient.
+if ! dpkg-query -W -f='${Status}' nala 2>/dev/null | grep -qx 'install ok installed' || \
+   ! command -v nala >/dev/null 2>&1 || ! nala --version >/dev/null 2>&1; then
+    echo '  x Nala missing or broken in the prebuilt Live image. Refusing to issue an ISO with a non-working updater.'
+    exit 1
+fi
+echo "  + Nala verified in bundled Live image: $(nala --version)"
 
 # A zero exit code alone is insufficient: check the essential desktop,
 # window manager and its applications before certifying the live image.

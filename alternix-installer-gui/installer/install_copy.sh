@@ -243,6 +243,12 @@ EOF
         fi
     done
 
+    # The updater needs Nala on the installed system, not only in the
+    # build-time Live environment. Prevent autoremove purging it.
+    if chroot "$ALTERNIX_MOUNT" dpkg-query -W -f='${Status}' nala 2>/dev/null | \
+            grep -qx 'install ok installed'; then
+        chroot "$ALTERNIX_MOUNT" apt-mark manual nala >>"$ALTERNIX_LOG" 2>&1 || true
+    fi
     _copy_chroot "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y" \
         >>"$ALTERNIX_LOG" 2>&1 || true
 

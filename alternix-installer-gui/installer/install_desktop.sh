@@ -216,30 +216,21 @@ _install_alternix() {
         return 1
     fi
     fi   # end: copy-from-image else clone
-    # Use the APT-only installer shipped with this ISO, just like the
-    # prebuilt desktop path. The source still comes from GitHub in net mode.
-    if [[ -s "${INSTALLER_DIR}/install-alternix_devuan.sh" ]]; then
-        cp -f "${INSTALLER_DIR}/install-alternix_devuan.sh" \
-            "${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}/Alternix/install-alternix_devuan.sh" || return 1
-        sed -i 's/\r$//' \
-            "${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}/Alternix/install-alternix_devuan.sh"
+    # The installed AlternixDE checkout is authoritative. Do not override
+    # its installer with a file belonging to the AlternixOS ISO project.
+    local de_install_source="${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}/Alternix/install-alternix_devuan.sh"
+    if [[ ! -s "$de_install_source" ]]; then
+        err "AlternixDE checkout is missing install-alternix_devuan.sh."
+        return 1
+    fi
+    if ! bash -n "$de_install_source"; then
+        err "AlternixDE installer has a syntax error; please fix upstream."
+        return 1
     fi
     _chroot "chown -R ${ALTERNIX_USERNAME}:${ALTERNIX_USERNAME} /home/${ALTERNIX_USERNAME}/Alternix"
 
-    # osm-sudo: make the GUI pattern-auth wrapper available system-wide,
-    # and export SUDO_ASKPASS so apps using 'sudo -A' get the GUI prompt.
-    if [[ -f "/home/${ALTERNIX_USERNAME}/Alternix/osm-sudo" ]] || \
-       [[ -f "${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}/Alternix/osm-sudo" ]]; then
-        local osm_src="${ALTERNIX_MOUNT}/home/${ALTERNIX_USERNAME}/Alternix/osm-sudo"
-        [[ -f "$osm_src" ]] || osm_src="/home/${ALTERNIX_USERNAME}/Alternix/osm-sudo"
-        tr -d '\r' < "$osm_src" > "${ALTERNIX_MOUNT}/usr/local/bin/osm-sudo"
-        chmod +x "${ALTERNIX_MOUNT}/usr/local/bin/osm-sudo"
-        cat > "${ALTERNIX_MOUNT}/etc/profile.d/osm-sudo.sh" << 'OSMEOF'
-# Alternix GUI sudo: apps calling "sudo -A" get the osm-lock pattern prompt
-export SUDO_ASKPASS=/usr/local/bin/osm-sudo
-OSMEOF
-        ok "osm-sudo installed to /usr/local/bin (CRLF stripped)."
-    fi
+    # osm-sudo is installed and managed by AlternixDE's own installer.
+    # Do not copy, transform, or configure it from the AlternixOS installer.
 
     step 3 3 "Running the Alternix installer..."
     echo ""
@@ -359,14 +350,8 @@ KBEOF
         echo "=== end pre-flight ==="
     } >> "$_alt_de_log" 2>&1
 
-    # CRLF GUARD
-    # The repository may carry CRLF line endings. A carriage return on
-    # the shebang line makes the kernel look for an interpreter called
-    # "bash\r", which fails with a bare "no such file or directory" and
-    # no output whatsoever — exactly the symptom being chased here.
-    chroot "$ALTERNIX_MOUNT" /bin/bash -c \
-        "sed -i 's/\r$//' /home/${ALTERNIX_USERNAME}/Alternix/install-alternix_devuan.sh" \
-        >> "$_alt_de_log" 2>&1 || true
+    # Never rewrite an installer cloned from AlternixDE. The syntax
+    # check above will detect an invalid copy without changing it.
 
     # BUILD WRAPPERS — needed by BOTH the graphical and text installer.
     # The service-start failure happens in any chroot, not only when
