@@ -70,83 +70,185 @@ v_list() {
     done < <(net_list_interfaces)
 }
 
+# The live-preview session already runs NetworkManager. Do not start a
+# second wpa_supplicant or DHCP client against an NM-managed Wi-Fi device.
+nm_running() {
+    command -v nmcli >/dev/null 2>&1 &&
+        [[ "$(nmcli -g RUNNING general 2>/dev/null)" == running ]]
+}
+
 v_scan() {
     local iface="${1:-}"
     [[ -n "$iface" ]] || die "scan: missing interface"
     net_is_wireless "$iface" || die "scan: ${iface} is not a wireless interface"
-    net_wifi_scan "$iface"
+    if nm_running; then
+        nmcli radio wifi on >/dev/null 2>&1 || true
+        nmcli --wait 15 device wifi rescan ifname "$iface" >/dev/null 2>&1 || true
+        nmcli -t --escape no -f SSID device wifi list ifname "$iface" | sed '/^$/d' | sort -u
+    else
+        net_wifi_scan "$iface"
+    fi
 }
 
 v_connect_eth() {
     local iface="${1:-}"
     [[ -n "$iface" ]] || die "connect-eth: missing interface"
-    net_setup_ethernet "$iface"
-}
-
-v_connect_wifi() {
-    local iface="${1:-}" ssid="${2:-}"
-    [[ -n "$iface" ]] || die "connect-wifi: missing interface"
-    [[ -n "$ssid"  ]] || die "connect-wifi: missing SSID"
-
-    command -v wpa_supplicant >/dev/null 2>&1 || \
-        die "wpa_supplicant not found — cannot connect to WiFi."
-
-    # PSK arrives on stdin so it never appears in /proc/<pid>/cmdline.
-    local psk=""
-    IFS= read -r psk || true
-
-    local wpa_conf
-    wpa_conf=$(mktemp /tmp/wpa.XXXXXX.conf)
-    chmod 600 "$wpa_conf"
-
-    if [[ -z "$psk" ]]; then
-        cat > "$wpa_conf" << EOF
-network={
-    ssid="${ssid}"
-    key_mgmt=NONE
-}
-EOF
+    if nm_running; then
+        nmcli --wait 35 device connect "$iface" >&2
     else
-        if ! wpa_passphrase "$ssid" "$psk" > "$wpa_conf" 2>/dev/null; then
-            rm -f "$wpa_conf"
-            die "wpa_passphrase rejected the password (8-63 characters required)."
+        net_setup_ethernet "$iface"
+    fi
+}
+
+# NetworkManager connection profiles are the source of truth in the live
+# image and are copied into the installed system. Avoid nmcli's "password"
+# argv option: command-line arguments expose secrets through /proc.
+v_connect_wifi_nm() {
+    local iface="$1" ssid="$2" psk="$3"
+    local uuid conf hashed="" wpa_output="" security="" security_row="" use_sae=0
+    uuid=$(cat /proc/sys/kernel/random/uuid) || die "Cannot obtain Wi-Fi profile UUID."
+    mkdir -p /etc/NetworkManager/system-connections || return 1
+    conf="/etc/NetworkManager/system-connections/alternix-installer-${uuid}.nmconnection"
+
+    # Compute a WPA2 PSK from STDIN, never from command-line arguments.
+    # This also avoids leaving the clear-text '#psk=' wpa_passphrase comment
+    # in the installed connection file. For an open AP, omit security keys.
+    if [[ -n "$psk" ]]; then
+        # WPA3-SAE-only access points need the original passphrase, not the
+        # WPA2 64-hex derived key. Transition-mode WPA2/WPA3 uses WPA2.
+        while IFS= read -r security_row; do
+            if [[ "$security_row" == "$ssid:"* ]]; then
+                security="${security_row#"$ssid:"}"
+                break
+            fi
+        done < <(nmcli -t --escape no -f SSID,SECURITY device wifi list ifname "$iface" 2>/dev/null)
+        if [[ "$security" == *WPA3* && "$security" != *WPA2* ]]; then
+            use_sae=1
+        fi
+        if (( use_sae )); then
+            [[ ${#psk} -le 63 ]] || { echo "WPA3 password is too long." >&2; return 1; }
+        else
+            [[ ${#psk} -ge 8 && ${#psk} -le 63 ]] || {
+                echo "WPA2 password must be 8–63 characters; the supplied length is ${#psk}." >&2
+                return 1
+            }
+            command -v wpa_passphrase >/dev/null 2>&1 || die "wpa_passphrase is missing."
+            if ! wpa_output=$(printf '%s\n' "$psk" | wpa_passphrase "$ssid" 2>&1); then
+                echo "Could not prepare WPA credentials: ${wpa_output}" >&2
+                return 1
+            fi
+            hashed=$(printf '%s\n' "$wpa_output" | sed -nE 's/^[[:space:]]*psk=([0-9a-fA-F]{64})[[:space:]]*$/\1/p' | head -n1)
+            [[ ${#hashed} -eq 64 ]] || die "Could not generate a 64-digit WPA PSK."
         fi
     fi
 
-    pkill -f "wpa_supplicant.*${iface}" 2>/dev/null
-    sleep 0.5
+    # A private NetworkManager keyfile is loaded explicitly. Unlike the
+    # legacy code it does not kill NetworkManager's supplicant instance.
+    umask 077
+    {
+        printf '[connection]\nid=Alternix-WiFi-%s\nuuid=%s\ntype=wifi\nautoconnect=true\n\n' "$uuid" "$uuid"
+        printf '[wifi]\nmode=infrastructure\nssid=%s\n\n' "$ssid"
+        if (( use_sae )); then
+            # SAE requires the original password. Keep file root-only (0600).
+            printf '[wifi-security]\nkey-mgmt=sae\npsk=%s\n\n' "$psk"
+        elif [[ -n "$hashed" ]]; then
+            printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$hashed"
+        fi
+        printf '[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n'
+    } > "$conf" || return 1
+    chmod 600 "$conf"
 
-    ip link set "$iface" up 2>/dev/null
-    wpa_supplicant -B -i "$iface" -c "$wpa_conf" >/dev/null 2>&1
-    sleep 4
-
-    net_dhcp "$iface"
-
-    if ! net_is_connected; then
-        rm -f "$wpa_conf"
-        echo "Failed to connect to '${ssid}'." >&2
+    if ! nmcli connection load "$conf" >&2; then
+        rm -f -- "$conf"
+        echo "NetworkManager could not load the Wi-Fi connection profile." >&2
         return 1
     fi
-
-    # POWERSAVE OFF — mirrors network.sh net_wifi_tui.
-    # WiFi powersave stalls debootstrap mid-download.
+    if ! nmcli --wait 45 connection up uuid "$uuid" ifname "$iface" >&2; then
+        # Never leave a failed attempt's credentials in the live image.
+        nmcli connection delete uuid "$uuid" >/dev/null 2>&1 || true
+        rm -f -- "$conf"
+        echo "NetworkManager failed to activate the connection (not necessarily a wrong password)." >&2
+        return 1
+    fi
+    # Keep the NM profile: the prebuilt rootfs copy carries this secure
+    # file into the installed system for automatic reconnection at boot.
     iw dev "$iface" set power_save off 2>/dev/null || true
-
-    # WIFI CARRYOVER — mirrors network.sh net_wifi_tui.
-    # configure_system.sh copies this file into the installed system
-    # so the target auto-reconnects on first boot. Without it the
-    # user reboots into a machine with no network.
-    mkdir -p /etc/wpa_supplicant
-    {
-        echo "ctrl_interface=/run/wpa_supplicant"
-        echo "update_config=1"
-        cat "$wpa_conf"
-    } > /etc/wpa_supplicant/wpa_supplicant.conf
-    chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
-
-    rm -f "$wpa_conf"
-    echo "Connected to '${ssid}'." >&2
+    echo "Connected to '${ssid}' with NetworkManager." >&2
     return 0
+}
+
+# Non-NM fallback for the minimal net-install image. Unlike the live-preview
+# path it runs directly through wpa_supplicant and dhcpcd, as before.
+v_connect_wifi_legacy() {
+    local iface="$1" ssid="$2" psk="$3" wpa_conf
+    command -v wpa_supplicant >/dev/null 2>&1 || die "wpa_supplicant is missing."
+    wpa_conf=$(mktemp /tmp/wpa.XXXXXX.conf) || return 1
+    chmod 600 "$wpa_conf"
+    if [[ -z "$psk" ]]; then
+        printf 'network={\n  ssid="%s"\n  key_mgmt=NONE\n}\n' "$ssid" > "$wpa_conf"
+    elif ! printf '%s\n' "$psk" | wpa_passphrase "$ssid" > "$wpa_conf"; then
+        rm -f "$wpa_conf"
+        echo "Could not prepare WPA credentials." >&2
+        return 1
+    fi
+    pkill -f "wpa_supplicant.*${iface}" 2>/dev/null || true
+    ip link set "$iface" up 2>/dev/null || true
+    if ! wpa_supplicant -B -i "$iface" -c "$wpa_conf" >&2; then
+        rm -f "$wpa_conf"
+        echo "wpa_supplicant failed to start." >&2
+        return 1
+    fi
+    if command -v wpa_cli >/dev/null 2>&1; then
+        local attempt state=""
+        for attempt in $(seq 1 25); do
+            state=$(wpa_cli -i "$iface" status 2>/dev/null | sed -n 's/^wpa_state=//p')
+            [[ "$state" == COMPLETED ]] && break
+            sleep 1
+        done
+        if [[ "$state" != COMPLETED ]]; then
+            rm -f "$wpa_conf"
+            echo "Wi-Fi association failed (state: ${state:-unknown})." >&2
+            return 1
+        fi
+    else
+        sleep 4
+    fi
+    if ! net_dhcp "$iface"; then
+        rm -f "$wpa_conf"
+        echo "Associated to Wi-Fi but could not get a DHCP address." >&2
+        return 1
+    fi
+    iw dev "$iface" set power_save off 2>/dev/null || true
+    mkdir -p /etc/wpa_supplicant
+    { printf 'ctrl_interface=/run/wpa_supplicant\nupdate_config=1\n'; cat "$wpa_conf"; } \
+        > /etc/wpa_supplicant/wpa_supplicant.conf
+    chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+    rm -f "$wpa_conf"
+    echo "Connected to '${ssid}' with wpa_supplicant." >&2
+}
+
+v_connect_wifi() {
+    local iface="${1:-}" ssid="${2:-}" psk=""
+    [[ -n "$iface" ]] || die "connect-wifi: missing interface"
+    [[ -n "$ssid" ]] || die "connect-wifi: missing SSID"
+    # The GUI sends one line of UTF-8 followed by a newline.
+    IFS= read -r psk || true
+    if nm_running; then
+        v_connect_wifi_nm "$iface" "$ssid" "$psk"
+    else
+        v_connect_wifi_legacy "$iface" "$ssid" "$psk"
+    fi
+}
+
+v_status() {
+    # NetworkManager's connectivity probe works on networks where ICMP to
+    # 8.8.8.8 is blocked. Require actual internet for online-only options.
+    if nm_running; then
+        local connectivity
+        connectivity=$(nmcli --wait 8 networking connectivity check 2>/dev/null) || true
+        [[ "$connectivity" == full ]] && return 0
+    fi
+    net_is_connected
 }
 
 # ── Dispatch ──────────────────────────────────────────────────────
@@ -158,7 +260,7 @@ case "$1" in
     scan)         shift; v_scan "$@" ;;
     connect-eth)  shift; v_connect_eth "$@" ;;
     connect-wifi) shift; v_connect_wifi "$@" ;;
-    status)       net_is_connected ;;
+    status)       v_status ;;
     synctime)     net_sync_clock ;;
     *)            usage ;;
 esac
