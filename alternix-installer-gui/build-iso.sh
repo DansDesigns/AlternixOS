@@ -1898,32 +1898,34 @@ if background_image /boot/grub/background.png; then
 fi
 
 # Unversioned names are created by the 9999 binary hook.
+# Select the partition containing the live rootfs: the embedded EFI FAT32
+# partition also contains a separate copy of the kernel for x64 Visor.
 menuentry "Install Alternix" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer quiet
     initrd /live/initrd.img
 }
 
 menuentry "Try Alternix (Live)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.live=1 quiet
     initrd /live/initrd.img
 }
 
 menuentry "Install Alternix (text mode)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 quiet
     initrd /live/initrd.img
 }
 
 menuentry "Install Alternix (nomodeset)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer nomodeset
     initrd /live/initrd.img
 }
 
 menuentry "Install Alternix (safe mode, text)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 noapic noacpi nomodeset
     initrd /live/initrd.img
 }
@@ -2028,54 +2030,71 @@ if insmod efi_gop; then
 fi
 echo 'Alternix: 32-bit UEFI GRUB started (64-bit firmware uses Visor).'
 
-# GRUB can see ISO9660 media (dd) and FAT USB sticks (Rufus ISO mode).
-# Do NOT search for the ESP: on dd media it only contains bootloaders.
+# IMPORTANT: select the live ROOT filesystem, NOT just a kernel filename.
+# On raw/DD ISO media the embedded FAT32 EFI image contains /live/vmlinuz
+# and /live/initrd.img for x64 Visor; searching either file can select this
+# ESP instead of the ISO9660 partition containing filesystem.squashfs.
+# On ISO-extracted media the FAT32 live partition has the same squashfs.
+# This unique search works for both USB layouts and all IA32 menu entries.
 menuentry "Install Alternix" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer quiet
     initrd /live/initrd.img
 }
 
 menuentry "Try Alternix (Live)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.live=1 quiet
     initrd /live/initrd.img
 }
 menuentry "Install Alternix (text mode)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 quiet
     initrd /live/initrd.img
 }
 menuentry "Install Alternix (nomodeset)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer nomodeset
     initrd /live/initrd.img
 }
 menuentry "Install Alternix (safe mode, text)" {
-    search --no-floppy --file --set=root /live/vmlinuz
+    search --no-floppy --file --set=root /live/filesystem.squashfs
     linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 noapic noacpi nomodeset
     initrd /live/initrd.img
 }
-# Explicitly report kernel messages and avoid i915 if EFI->kernel handoff
-# causes a blank screen. This is only an alternative entry, not the default.
+# Diagnostic compatibility path only. GRUB 2.12 changed EFI PE loading;
+# removing peimage can select the older handover implementation on affected
+# firmware. Keep the normal entries unchanged; Intel graphics stays disabled.
 menuentry "Install Alternix (verbose / Intel graphics off)" {
-    search --no-floppy --file --set=root /live/vmlinuz
-    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 nomodeset i915.modeset=0 loglevel=7 ignore_loglevel plymouth.enable=0
+    set debug=linux
+    set gfxpayload=text
+    rmmod peimage
+    search --no-floppy --file --set=root /live/filesystem.squashfs
+    echo "Loading kernel from the live filesystem on $root..."
+    linux /live/vmlinuz boot=live components live-config.username=root live-config.autologin=root pci=noaer alternix.tui=1 nomodeset i915.modeset=0 loglevel=7 ignore_loglevel plymouth.enable=0 intel_idle.max_cstate=1
+    echo 'Kernel loaded; loading initrd...'
     initrd /live/initrd.img
+    echo 'Initrd loaded; entering Linux...'
 }
 # A no-kernel boot check; useful when a machine can show the GRUB menu but
 # hangs as soon as Linux is selected. It makes no disk modifications.
 menuentry "Diagnostics: verify GRUB and boot files (no Linux)" {
     echo "Alternix EFI diagnostic (firmware arch: $grub_cpu/$grub_platform)"
-    if search --no-floppy --file --set=root /live/vmlinuz; then
-        echo "PASS: /live/vmlinuz found on $root"
-        if test -f /live/initrd.img; then
-            echo "PASS: /live/initrd.img found"
+    if search --no-floppy --file --set=root /live/filesystem.squashfs; then
+        echo "PASS: live filesystem.squashfs found on $root"
+        if test -f /live/vmlinuz; then
+            echo "PASS: kernel /live/vmlinuz found on $root"
         else
-            echo "ERROR: /live/initrd.img is missing"
+            echo "ERROR: /live/vmlinuz missing from live root"
+        fi
+        if test -f /live/initrd.img; then
+            echo "PASS: /live/initrd.img found on $root"
+        else
+            echo "ERROR: /live/initrd.img missing from live root"
         fi
     else
-        echo "ERROR: /live/vmlinuz not found: USB layout/media unreadable"
+        echo "ERROR: live filesystem.squashfs not found: USB layout/media unreadable"
+        echo 'The EFI system partition alone is not a bootable live rootfs.'
     fi
     echo 'Select any key to return to the GRUB menu.'
     read
@@ -2682,12 +2701,26 @@ for (( _try=0; _try<${#BOOTSTRAP_MIRRORS[@]}; _try++ )); do
     _mirror="${BOOTSTRAP_MIRRORS[$_try]}"
     if (( _try > 0 )); then
         _info "Cleaning partial build before changing mirrors..."
-        # --purge removes partial caches/state but retains config/, hooks,
-        # package lists and installer assets created earlier in this script.
+        # Purge the failed bootstrap/cache, but keep the custom config/ tree,
+        # package lists, binary/chroot hooks and EFI boot files. live-build
+        # also removes its .build/config *stage marker* during a purge; if we
+        # run lb build immediately afterwards, debootstrap may succeed but
+        # the chroot stage aborts with "required to be done first: config".
         if ! lb clean --purge >> "$ATTEMPTS_LOG" 2>&1; then
             _die "Cannot clean failed build. See $ATTEMPTS_LOG"
         fi
         _switch_live_build_mirror "$DEVUAN_MIRROR" "$_mirror"
+        # Regenerate live-build's internal stage marker using the existing
+        # config/ settings (no default-overriding command-line arguments).
+        # Do this AFTER changing the mirror so the next bootstrap and chroot
+        # use the chosen Devuan mirror. Never substitute a hand-made marker.
+        _info "Restoring live-build configuration after cache purge..."
+        if ! lb config >> "$ATTEMPTS_LOG" 2>&1; then
+            _die "Cannot restore live-build configuration after purge. See $ATTEMPTS_LOG"
+        fi
+        if [[ ! -f .build/config ]]; then
+            _die "live-build did not restore .build/config; refusing another incomplete build. See $ATTEMPTS_LOG"
+        fi
     fi
     printf '\n==== Build attempt %s/%s | mirror: %s ====\n' \
         "$((_try + 1))" "${#BOOTSTRAP_MIRRORS[@]}" "$_mirror" | tee -a "$ATTEMPTS_LOG"
@@ -2799,6 +2832,10 @@ fi
 if ! mdir -i "$EFI_IMG" ::/EFI/BOOT/BOOTX64.EFI >/dev/null 2>&1; then
     _die "Rebuilding embedded EFI image lost the 64-bit UEFI loader."
 fi
+# The IA32 menu locates the ISO/extracted media by its root squashfs,
+# not by /live/vmlinuz (which also lives inside Visor's separate FAT ESP).
+[[ -s "${BUILD_DIR}/binary/live/filesystem.squashfs" ]] || \
+    _die "IA32 GRUB cannot locate the live rootfs: live/filesystem.squashfs is missing."
 # Presence alone is insufficient: a stale live-build IA32 loader can remain
 # inside efi.img if the replacement silently failed. Compare the file bytes.
 EFI_VERIFY_TMP=$(mktemp -d)
@@ -2900,21 +2937,19 @@ else
     _info "WARNING: Visor build unavailable; x64 UEFI uses live-build GRUB fallback."
 fi
 
-# The ISO is amd64 even on an IA32 UEFI tablet. This requires kernel EFI
-# mixed-mode support plus the handover entry used by i386-efi GRUB. Report
-# incompatibility instead of mistaking a compiled GRUB binary for proof of boot.
+# The ISO is amd64 even on IA32 UEFI tablets. i386-efi GRUB needs a
+# 64-bit Linux kernel with 32-bit EFI handover support; a valid GRUB menu
+# alone is not proof that the kernel can start on the tablet.
 _step "Checking 32-bit firmware / 64-bit kernel compatibility"
 KCONFIG=$(find "${BUILD_DIR}/chroot/boot" -maxdepth 1 -name 'config-*' 2>/dev/null | sort -V | tail -1)
 if [[ -n "$KCONFIG" && -f "$KCONFIG" ]]; then
-    if grep -qx 'CONFIG_EFI_MIXED=y' "$KCONFIG" && \
-       grep -qx 'CONFIG_EFI_HANDOVER_PROTOCOL=y' "$KCONFIG"; then
-        _ok "Kernel supports 32-bit EFI firmware booting an amd64 kernel."
-    else
-        _info "WARNING: $KCONFIG lacks CONFIG_EFI_MIXED=y or EFI handover."
-        _info "GRUB IA32 menu may open, but the 64-bit kernel may not start."
+    if ! grep -qx 'CONFIG_EFI_MIXED=y' "$KCONFIG" || \
+       ! grep -qx 'CONFIG_EFI_HANDOVER_PROTOCOL=y' "$KCONFIG"; then
+        _die "Kernel $KCONFIG lacks CONFIG_EFI_MIXED=y or EFI handover; 32-bit UEFI tablets would not boot."
     fi
+    _ok "Kernel configuration enables EFI mixed mode and handover."
 else
-    _info "Kernel config not found; cannot verify EFI mixed-mode capability."
+    _info "Kernel config not found; checking the actual kernel boot header instead."
 fi
 
 # Post-build safety net: verify unversioned kernel exists in the binary tree
@@ -2938,6 +2973,28 @@ if [[ -d "$BIN_LIVE" ]] && [[ ! -f "${BIN_LIVE}/vmlinuz" ]]; then
         _ok "Kernel injected into ISO."
     fi
 fi
+
+# XLF_KERNEL_64 (bit 0) and XLF_EFI_HANDOVER_32 (bit 2) are defined by
+# the upstream Linux x86 boot protocol in the bzImage header at 0x236.
+# Refuse an ISO that has the right GRUB menu but cannot boot its kernel
+# from 32-bit firmware (the Linx 810B failure mode).
+KERNEL_IMAGE="${BUILD_DIR}/binary/live/vmlinuz"
+[[ -s "$KERNEL_IMAGE" ]] || _die "Missing unversioned live kernel: $KERNEL_IMAGE"
+python3 - "$KERNEL_IMAGE" <<'EFIHANDOVERPY' || _die "ISO kernel cannot boot from 32-bit UEFI via GRUB handover."
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+with path.open('rb') as handle:
+    header = handle.read(0x238)
+if len(header) < 0x238 or header[0x202:0x206] != b'HdrS':
+    raise SystemExit('ERROR: live/vmlinuz does not have a valid x86 Linux boot header')
+flags = int.from_bytes(header[0x236:0x238], 'little')
+if not flags & 0x1:
+    raise SystemExit('ERROR: live/vmlinuz has no XLF_KERNEL_64 flag')
+if not flags & 0x4:
+    raise SystemExit('ERROR: live/vmlinuz lacks XLF_EFI_HANDOVER_32; IA32 UEFI cannot hand over to this kernel')
+print(f'  + 64-bit kernel has the required 32-bit EFI handover flag (xloadflags=0x{flags:04x}).')
+EFIHANDOVERPY
 
 # live-build's hybrid partition tables are already correct. Finalise by
 # verifying both loaders in the finished ISO using the exact Rock Ridge
