@@ -44,7 +44,7 @@ cd ~/alternix-installer
 
 sudo env DEVUAN_MIRROR=https://ftp.fau.de/devuan/merged bash build-iso.sh
 
-#sudo bash build-iso.sh
+sudo bash build-iso.sh
 
 
 
