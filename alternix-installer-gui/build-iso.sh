@@ -898,6 +898,77 @@ done
 rm -f config/includes.chroot/installer/install-alternix_devuan.sh
 chmod +x config/includes.chroot/installer/*.sh
 
+# ── Optional Flatpak selections in the EXISTING graphical installer ─────
+# The AlternixDE desktop setup script runs during image prebuild, whereas
+# the real, clickable "Optional components" page is in installer/osm-install.cpp.
+# Maintain that source in the ISO repository itself (not a patch file or an
+# untracked runtime override). The page's existing code automatically writes
+# the selected IDs to ALTERNIX_OPTIONAL, shows them in the summary, and requires
+# an internet connection for them. installer/install_optional.sh runs their
+# standalone installers against the TARGET root after AlternixDE is installed.
+OSM_GUI_SOURCE="${SCRIPT_DIR}/installer/osm-install.cpp"
+[[ -s "$OSM_GUI_SOURCE" ]] || _die "Graphical installer source missing: $OSM_GUI_SOURCE"
+for group in games extras; do
+    [[ -s "${SCRIPT_DIR}/installer/optional/${group}.sh" ]] || \
+        _die "Missing optional Flatpak installer: installer/optional/${group}.sh"
+done
+python3 - "$OSM_GUI_SOURCE" <<'ALTERNIX_GUI_OPTIONAL_PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+original = source.read_text(encoding="utf-8")
+table = "static const OptionalComponent OPTIONAL_COMPONENTS[] = {"
+start = original.find(table)
+if start < 0:
+    raise SystemExit("ERROR: osm-install.cpp is missing OPTIONAL_COMPONENTS")
+end = original.find("\n};", start)
+if end < 0:
+    raise SystemExit("ERROR: cannot locate the end of OPTIONAL_COMPONENTS")
+block = original[start:end]
+if '"telephony"' not in block:
+    raise SystemExit("ERROR: Mobile telephony component is missing; refusing to alter this GUI")
+components = (
+    ('games', 'Games',
+     'RetroDECK, Warzone 2100 and 0 A.D. Requires an internet connection.'),
+    ('extras', 'Extras',
+     'Nucleus, Gaia Sky, Emergency Alerts, Keypunch and Shortwave. '
+     'Requires an internet connection.'),
+)
+rows = []
+for comp_id, name, description in components:
+    if f'"{comp_id}"' not in block:
+        rows.append('    {"' + comp_id + '", "' + name + '",\n'
+                    '     "' + description + '",\n'
+                    '     false},')
+if rows:
+    # Insert at the end of the existing table, before any commented-out
+    # example rows. Do not modify widgets, keyboard layout or other pages.
+    comment = block.find('    // {')
+    insert_at = start + comment if comment >= 0 else end
+    new_source = original[:insert_at] + "\n".join(rows) + "\n" + original[insert_at:]
+    source.write_text(new_source, encoding="utf-8")
+    print("  + Updated installer/osm-install.cpp: Games and Extras cards added.")
+else:
+    print("  + installer/osm-install.cpp already contains Games and Extras.")
+
+# The table is the source of truth: selected component IDs are collected
+# by OptionalPage and passed through ALTERNIX_OPTIONAL to install_optional.sh.
+ALTERNIX_GUI_OPTIONAL_PY
+
+# The above directly updates the SOURCE file in the ISO repository; recopy it
+# so live-build compiles the same version in both net-install and live-preview.
+cp -a "$OSM_GUI_SOURCE" config/includes.chroot/installer/osm-install.cpp
+for group in games extras; do
+    [[ -s "config/includes.chroot/installer/optional/${group}.sh" ]] || \
+        _die "The $group Flatpak installer was not embedded."
+done
+grep -Fq '{"games", "Games",' config/includes.chroot/installer/osm-install.cpp || \
+    _die "Games choice missing from embedded osm-install.cpp."
+grep -Fq '{"extras", "Extras",' config/includes.chroot/installer/osm-install.cpp || \
+    _die "Extras choice missing from embedded osm-install.cpp."
+_ok "Games and Extras are embedded on the graphical Optional components page."
+
 _ok "Installer scripts embedded."
 
 # ── live-boot package (required for boot=live to work) ────────────
