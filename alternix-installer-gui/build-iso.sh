@@ -1054,6 +1054,16 @@ cp -a "$DE_DIR" /usr/share/alternix/AlternixDE
 # open so the installer's read commands do not abort on EOF under set -e.
 export TARGET_USER="root"
 export DEBIAN_FRONTEND=noninteractive
+# ISO desktop prebuild runs as real root inside a chroot, not as the
+# interactive desktop user. An outer `sudo bash build-iso.sh` may leave
+# SUDO_USER/SUDO_UID/SUDO_GID in the environment. Those inherited values
+# incorrectly trigger Rounded Corners' normal-user-only guard and can
+# also make other installers write to the build host user's home.
+# The explicit prebuild flag is consumed by install_corners.sh: install
+# system files and root's template shortcuts, but never start an X overlay.
+# The desktop template is copied from /root into /etc/skel below.
+unset SUDO_USER SUDO_UID SUDO_GID
+export ALTERNIX_ISO_PREBUILD=1
 # `clear` on line 3 of that script fails under TERM=dumb or an unset
 # TERM, and `set -e` on line 2 then kills it with no output.
 export TERM=xterm
@@ -1142,6 +1152,26 @@ fi
 # account starts with its own .bashrc; supply just the required line.
 if ! grep -Fqx 'eval "$(starship init bash)"' /etc/skel/.bashrc 2>/dev/null; then
     printf '%s\n' 'eval "$(starship init bash)"' >> /etc/skel/.bashrc
+fi
+# Rounded Corners installs its shortcuts into the temporary root home
+# during the prebuild. They must reach /etc/skel so BOTH new copy-installed
+# users and the unprivileged Live user receive their own launchers.
+# Check only when Rounded Corners is part of the desktop: keep independent
+# builds without that optional application compatible.
+if [ -x /usr/bin/rounded_corners ]; then
+    for rounded_entry in \
+            .local/share/applications/rounded_corners.desktop \
+            .config/autostart/rounded_corners.desktop; do
+        if [ ! -s "/etc/skel/$rounded_entry" ]; then
+            echo "  x Rounded Corners is installed but its prebuilt user shortcut is missing: $rounded_entry"
+            exit 1
+        fi
+    done
+    if ! python3 -c 'from PIL import Image; from Xlib import display; import screeninfo' >/dev/null 2>&1; then
+        echo '  x Rounded Corners is installed but its Linux Python dependencies are missing.'
+        exit 1
+    fi
+    echo '  + Rounded Corners installed with per-user menu/autostart templates (no chroot overlay).'
 fi
 # Fail at build time if the image is incomplete, not after erasing disks.
 for required in \
